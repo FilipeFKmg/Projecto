@@ -4,8 +4,8 @@ Este repositório contém uma pipeline automatizada para a extração, curadoria
 
 ## Contexto do Projecto
 
----
 O objetivo é identificar tendências de inovação e principais intervenientes (Companies) no setor farmacêutico de siRNA. A pipeline resolve problemas críticos de mineração de dados em patentes, como a expiração de tokens de API e a inconsistência na nomenclatura de empresas e universidades.
+
 ---
 
 ## Estrutura do Repositório

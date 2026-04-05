@@ -3,7 +3,7 @@
 Este repositório contém uma pipeline automatizada para a extração, curadoria e harmonização de metadados de patentes provenientes do **European Patent Office (EPO)**. O projeto foca-se no panorama competitivo de terapias baseadas em RNA de interferência (siRNA/RNAi).
 
 ## Contexto do Projecto
-"\n",
+
 O objetivo é identificar tendências de inovação e principais intervenientes (Key Opinion Leaders/Companies) no setor farmacêutico de siRNA. A pipeline resolve problemas críticos de mineração de dados em patentes, como a expiração de tokens de API e a inconsistência na nomenclatura de empresas e universidades.
 ---
 

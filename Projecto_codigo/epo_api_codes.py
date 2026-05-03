@@ -20,7 +20,7 @@ Search strategy:
       the 2000-result API hard limit.
     - Family deduplication: across all queries and all years, only one
       representative per patent family is kept, preferring English-publishing
-      jurisdictions (US > EP > WO > GB > AU > CA > NZ > IE).
+      jurisdictions (WO > US > EP > GB > AU > CA > NZ > IE).
     - Exclusions: Aptamers (C12N15/115) and Immunomodulatory (C12N15/117)
       are excluded from every query.
 """
@@ -257,10 +257,6 @@ def get_total_results_count(cql_query: str, consumer_key: str, consumer_secret: 
     print("[CRITICAL] EPO server consistently rejecting count requests. Skipping this slice.")
     return 0
 
-
-# =============================================================================
-# 3. FAMILY DEDUPLICATION
-# =============================================================================
 # =============================================================================
 # 3. FAMILY DEDUPLICATION
 # =============================================================================
@@ -350,15 +346,20 @@ def download_patent_ids(
     # -------------------------------------------------------------------------
     # Build the independent query list.
     # -------------------------------------------------------------------------
-    
+
     if only_applicant:
         if not applicant_filter:
             print("\n[ERROR] 'applicant_filter' must be provided if 'only_applicant' is True.")
+            # Cannot perform a search for a company without a name.
             return pd.DataFrame()
-        # Adds an empty item to ensure the extraction loop runs once
+            
+        # Adds a placeholder to ensure the extraction loop runs once when searching by applicant.
         independent_queries = [""]
     else:
+        
+        # Excludes CPC codes unrelated to siRNA (Aptamers and Immunomodulatory) from each query
         exclusions = ' NOT (cpc="C12N15/115" OR cpc="C12N15/117")'
+        
         independent_queries = []
 
         # CPC codes
@@ -593,17 +594,20 @@ def download_patent_ids(
     # MAIN LOOP — iterate over years, collect IDs, deduplicate, save
     # =========================================================================
     try:
+        # Accumulates one DataFrame per year before final concatenation and deduplication
         all_yearly_dfs = []
 
-        # Global family tracker: persists across years to avoid re-fetching
-        # families already collected in an earlier year. Maps family_id to
-        # the best country score seen so far.
+        # Tracks patent families across the entire date range to prevent the same family
+        # from appearing in multiple years' output. Updated incrementally after each year.
+        # Stores {family_id: best_country_priority_score}.
         seen_families_global = {}
 
         for current_year in range(start_year, end_year + 1):
             print(f"\n[INFO] Processing year {current_year}...")
 
-            # Run every independent query for this year and accumulate raw records
+            # Each independent query is fetched independently and merged here.
+            # search_with_slicing handles the 2,000-result API cap by cascading
+            # from yearly → monthly → daily windows until every slice fits.
             all_records_year = []
             for idx, base_query in enumerate(independent_queries):
                 print(f"  -> Query {idx+1}/{len(independent_queries)}: {base_query[:80]}...")
@@ -612,14 +616,14 @@ def download_patent_ids(
             print(f"[INFO] Raw records accumulated (including cross-query duplicates): "
                   f"{len(all_records_year)}")
 
-            # Deduplicate by patent family, skipping families already collected
-            # in previous years (unless a better-language representative is found)
+            # Keep only the best representative per patent family, skipping families
+            # already output in prior years (unless a higher-priority jurisdiction is found)
             total_ids_year, new_families = _deduplicate_by_family(
                 all_records_year,
                 seen_families=seen_families_global
             )
 
-            # Register this year's families in the global tracker
+            # Merge this year's families into the global tracker for subsequent years
             seen_families_global.update(new_families)
 
             print(f"[INFO] After family deduplication: {len(total_ids_year)} unique IDs")

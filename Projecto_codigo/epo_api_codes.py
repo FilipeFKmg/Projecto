@@ -186,19 +186,29 @@ def _clean_val(node) -> str:
 
 def get_total_results_count(cql_query: str, consumer_key: str, consumer_secret: str) -> int:
     """
-    Fetches only the total result count for a CQL query without downloading
-    any patent records. Uses X-OPS-Range: 1-1 to request a single result,
-    which forces the server to return the @total-result-count metadata at
-    minimal bandwidth cost.
+    Returns the total number of patents matching a CQL query without
+    downloading any records.
 
-    Retries up to 4 times with escalating waits on server errors.
+    Strategy: sends X-OPS-Range: 1-1 (one result only) so the server
+    returns the @total-result-count metadata field at minimal bandwidth
+    cost. This count is used by search_with_slicing to decide whether
+    the query needs to be broken into monthly or daily windows before
+    any actual records are fetched.
+
+    Retry policy: up to 4 attempts with escalating waits on transient
+    server errors (404, 429, 503). Permanent errors (400, 403) either
+    return 0 immediately or wait for a cooldown before retrying.
+
+    Args:
+        cql_query:       Full CQL query string, including date filter.
+        consumer_key:    EPO OPS API consumer key.
+        consumer_secret: EPO OPS API consumer secret.
 
     Returns:
-        int: Total number of patents matching the query, or 0 on unrecoverable error.
-
-    Raises:
-        Exception: If the server consistently rejects the request after 4 attempts.
+        int: Total result count, or 0 if the query returns no results
+             or fails after all retries.
     """
+    
     encoded_query = urllib.parse.quote(cql_query)
     url = f"https://ops.epo.org/3.2/rest-services/published-data/search?q={encoded_query}"
 
@@ -222,17 +232,17 @@ def get_total_results_count(cql_query: str, consumer_key: str, consumer_secret: 
                 return total
 
             elif response.status_code == 400:
-                # The CQL query syntax was rejected — skip this query entirely
+                # Permanent error the CQL querie rejected by the server by an syntax error; no point retrying
                 print(f"[SYNTAX ERROR 400] EPO rejected the query syntax. Skipping.")
                 return 0
 
             elif response.status_code == 404:
-                # Transient 404 mid-pagination or load balancer hiccup — retry
+                # Transient — load balancer hiccup or empty date window; retry up to 4 times
                 if attempt < 3:
                     print(f"[WARNING 404] Slice not found (attempt {attempt+1}/4). Retrying...")
                     time.sleep(20)
                     continue
-                # If we get here, it's genuinely empty
+                # Still 404 after 4 attempts, we will treat it genuinely empty
                 return 0
 
             elif response.status_code == 403:
@@ -241,8 +251,8 @@ def get_total_results_count(cql_query: str, consumer_key: str, consumer_secret: 
                 time.sleep(600)
 
             elif response.status_code in [429, 503]:
-                # Server overloaded — wait progressively longer on each attempt
-                wait_time = 60 * (attempt + 1)
+                # Server overloaded — back off progressively (300s, 600s, 900s, 1200s) 
+                wait_time = 300 * (attempt + 1)
                 print(f"[OVERLOAD {response.status_code}] API busy. Waiting {wait_time}s...")
                 time.sleep(wait_time)
 
@@ -254,6 +264,7 @@ def get_total_results_count(cql_query: str, consumer_key: str, consumer_secret: 
                 print(f"[ERROR] Connection failed after 4 attempts: {e}")
             time.sleep(20)
 
+    # All 4 attempts exhausted without a valid response, we will skip this slice
     print("[CRITICAL] EPO server consistently rejecting count requests. Skipping this slice.")
     return 0
 
@@ -383,30 +394,40 @@ def download_patent_ids(
     # Returns a list of dicts: [{'id', 'family_id', 'country'}, ...]
     # =========================================================================
     def search_patent_ids(cql_query: str, total_patents: int) -> list:
-        """
-        Downloads all patent IDs matching cql_query by paginating through the
-        EPO OPS /search endpoint in blocks of 90 results.
+    """
+    Downloads all patent IDs matching cql_query by paginating through the
+    EPO OPS /search endpoint in blocks of 100 results.
 
-        The EPO hard limit is 2000 results per query and 100 per page.
-        We use 90 per page (not 100) to stay safely below the page limit.
+    The EPO API enforces two hard limits:
+      - 2,000 results maximum per query (enforced by search_with_slicing upstream)
+      - 100 results maximum per page
 
-        Args:
-            cql_query:     The full CQL query string (already includes date filter).
-            total_patents: Total result count from get_total_results_count(),
-                           used to know when to stop paginating.
+    We use 100 per page, the maximum the API allows, to minimise the number
+    of requests needed and reduce total extraction time.
 
-        Returns:
-            list[dict]: Records with keys 'id', 'family_id', 'country'.
-        """
+    Args:
+        cql_query:     Full CQL query string, already including the date filter.
+        total_patents: Result count from get_total_results_count(), used to
+                       calculate page boundaries and know when to stop paginating.
+
+    Returns:
+        list[dict]: One dict per patent with keys 'id', 'family_id', 'country'.
+                    Cross-query duplicates are possible and resolved upstream
+                    by _deduplicate_by_family.
+    """
+    # Defensive cap: even if the caller passes a count above 2,000,
+    # the API will never return more than 2,000 results per query
         total_patents = min(total_patents, 2000)
         
         encoded_query     = urllib.parse.quote(cql_query)
         extracted_records = []
-        seen_ids          = set()   # Prevents duplicates within this single query
-        start_index       = 1
+        seen_ids          = set()   # Guards against duplicate IDs within this single query's pages
+        start_index       = 1       # EPO pagination is 1-based, not 0-based
 
+        # Paginate through all results in blocks of 100 until every record is collected
         while start_index <= total_patents:
-            end_index        = min(start_index + 89, total_patents)
+            # Calculate the end of this page without overshooting the total
+            end_index        = min(start_index + 99, total_patents)
             success_in_block = False
 
             for attempt in range(4):
@@ -422,13 +443,16 @@ def download_patent_ids(
                     res = requests.get(url, headers=headers, timeout=30)
 
                     if res.status_code == 200:
+                        # Unwrap the nested EPO JSON response structure
                         json_resp  = res.json()
                         wpd        = json_resp.get('ops:world-patent-data', {})
                         biblio     = wpd.get('ops:biblio-search', {})
                         search_res = biblio.get('ops:search-result', {})
                         test_docs  = search_res.get('ops:publication-reference', [])
 
-                        # Log the actual range returned vs what was requested
+                        # Log requested vs received range — a mismatch signals the API
+                        # returned fewer records than expected, which may indicate
+                        # truncation or a server-side pagination issue
                         ops_range = biblio.get('ops:range', {})
                         begin_pos = int(ops_range.get('@begin', 0))
                         end_pos   = int(ops_range.get('@end', 0))
@@ -437,11 +461,12 @@ def download_patent_ids(
                               f"Total expected: {total_patents}")
 
                         if not test_docs and attempt < 3:
-                            # Empty page — may be a transient issue, retry
+                            # HTTP 200 but empty page, maybe an server issue, retry
                             time.sleep(20)
                             continue
 
                         if attempt == 3 and not test_docs:
+                            # Still empty after 4 attempts, we give up on this page but warn
                             print("[WARNING] HTTP 200 but no documents found after 4 attempts.")
                             break
 
@@ -449,13 +474,14 @@ def download_patent_ids(
                         break
 
                     elif res.status_code == 400:
-                        # Malformed CQL — no point retrying
+                        # Permanent error — malformed CQL rejected by the server.
+                        # Return whatever records were collected before this failure
                         print(f"[SYNTAX ERROR 400] EPO rejected the query. Skipping block.")
                         return extracted_records
 
                     elif res.status_code == 404:
                         if start_index == 1:
-                            # First page returning 404 means no results at all
+                            # 404 on the very first page means probably no results exist for this query, but retrying to be sure
                             if attempt < 3:
                                 time.sleep(20)
                                 continue
@@ -463,58 +489,76 @@ def download_patent_ids(
                                 print(f"[WARNING 404] No results found after 4 attempts.")
                                 return extracted_records
                         else:
-                            # Transient 404 mid-pagination — retry
+                            # Transient 404 mid-pagination — load balancer hiccup, retry
                             print(f"[WARNING 404] Page {start_index} not found "
                                   f"(attempt {attempt+1}/4). Retrying...")
                             time.sleep(20)
                             continue
 
                     elif res.status_code == 403:
-                        # Rate limit or IP ban — wait 15 minutes
+                        # Rate limit or IP ban, we will wait 15 minutes then let the retry loop continue
                         print(f"[WARNING 403] Access denied. Waiting 15 min "
                               f"(attempt {attempt+1}/4)...")
                         time.sleep(900)
 
                     elif res.status_code in [429, 503]:
-                        # Server busy — wait progressively longer
-                        time.sleep(60 * (attempt + 1))
+                        # Server overloaded — back off progressively (300s, 600s, 900s, 1200s)
+                        time.sleep(300 * (attempt + 1))
 
                     else:
+                        # Unexpected status code — brief pause before retrying
                         time.sleep(15)
 
                 except Exception:
+                    # Network-level failure (timeout, connection reset, etc.), we will pause and retry
                     time.sleep(20)
 
             if not success_in_block:
-                # All retries exhausted for this page — stop paginating this query
+                # All 4 attempts exhausted for this page — abort pagination for this query
+                # and return however many records were successfully collected before the failure
                 break
 
-            # Parse the successfully retrieved page of documents
+            # ── Parse the successfully retrieved page of documents ──────────────────
+    
+            # EPO returns a single dict instead of a list when there is only one result
+            # on the page — normalise to a list so the loop below always works uniformly
             if isinstance(test_docs, dict):
-            
                 test_docs = [test_docs]
 
             for doc in test_docs:
-                # family_id sits as an attribute on the ops:publication-reference node
+                # family_id is stored as an attribute on the ops:publication-reference
+                # node itself, not as a nested child element
                 family_id = doc.get('@family-id', '').strip()
 
-                # The docdb document-id contains country, number, and kind code
+                # Each document can carry multiple document-id nodes in different formats
+                # (docdb, epodoc, original). We only want the 'docdb' format, which
+                # provides the structured country / number / kind breakdown we need.
                 dids = doc.get('document-id', doc.get('ops:document-id', []))
                 if isinstance(dids, dict):
+                    # Same single-item normalisation as test_docs above
                     dids = [dids]
 
+                # Extract only the docdb-format identifier — skip epodoc and original
                 docdb_node = next(
                     (d for d in dids if d.get('@document-id-type') == 'docdb'), None
                 )
+                
                 if docdb_node:
                     country = _clean_val(docdb_node.get('country', ''))
+                    
+                    # Strip spaces and dots that occasionally appear in raw doc-numbers
                     number  = _clean_val(docdb_node.get('doc-number', '')).replace(" ", "").replace(".", "")
+
+                    # Kind code (e.g. A1, B2) is optional — omit it if absent rather
+                    # than appending an empty string to the patent ID
                     kind    = _clean_val(docdb_node.get('kind', ''))
 
                     if country and number:
+                        # Assemble the docdb patent ID in "CC.NNNNNN.KK" style
                         pat_id = f"{country}{number}{kind}" if kind else f"{country}{number}"
-
-                        # Skip if already seen within this query's pagination
+                    
+                        # Deduplicate within this query's pages — cross-query duplicates
+                        # are resolved later by _deduplicate_by_family
                         if pat_id not in seen_ids:
                             seen_ids.add(pat_id)
                             extracted_records.append({
@@ -522,9 +566,10 @@ def download_patent_ids(
                                 'family_id': family_id,
                                 'country':   country,
                             })
-
+                            
+            # Advance to the next page
             start_index += 90
-            time.sleep(8)   # Conservative sleep to stay within rate limits
+            time.sleep(8)   # Conservative pause to stay within the ~10 req/min rate limit, tried 4 seconds got banned
 
         return extracted_records
 
@@ -535,7 +580,12 @@ def download_patent_ids(
     # =========================================================================
     def search_with_slicing(base_cql: str, year: int) -> list:
         
-        # Auxiliary function to build the correct CQL Função
+        # Assembles the final CQL query string by combining the base code query,
+        # an optional applicant filter, and the date window for the current slice.
+        # Three modes are supported:
+        #   1. only_applicant  — ignores base_cql entirely; searches by applicant name only
+        #   2. applicant_filter (hybrid) — ANDs the code query with the applicant name
+        #   3. codes only      — base_cql + date window, no applicant constraint
         def _build_cql(date_condition: str) -> str:
             if only_applicant:
                 return f'pa="{applicant_filter}" AND {date_condition}'
@@ -544,47 +594,69 @@ def download_patent_ids(
             else:
                 return f'{base_cql} AND {date_condition}'
 
-        # Building yearly querie
+        # Probe the total result count for the full year before fetching.
+        # This is a lightweight count-only call (no records downloaded) that
+        # determines whether a direct fetch is possible or slicing is required.
         year_cql = _build_cql(f'pd={year}')
         total = get_total_results_count(year_cql, consumer_key, consumer_secret)
 
+        # Nothing published this year for this query — skip entirely
         if total == 0:
             return []
-
+            
+        # Total patents in the year fits within the 2,000-result API hard limit, fetching the full year in one pass
         if total <= 2000:
             print(f"[INFO] Year {year}: {total} results. Fetching yearly...")
             return search_patent_ids(year_cql, total)
 
-        # Year exceeds 2000 — slice by month
+        # Year total exceeds the 2,000-result API hard limit — switch to monthly slicing.
+        # Each month is probed independently: if a month also exceeds 2,000, it will
+        # be sliced further by day in the next stage.
         ids = []
         print(f"[INFO] Year {year}: {total} results (>2000). Slicing by month...")
         for month in range(1, 13):
+            # Resolve the exact last day of the month to handle variable month lengths
+            # and leap years correctly (e.g. February = 28 or 29 days)
             last_day = calendar.monthrange(year, month)[1]
+            
+            # Build the date range strings in the YYYYMMDD format required by the EPO CQL syntax
             m_start  = f"{year}{month:02d}01"
             m_end    = f"{year}{month:02d}{last_day}"
 
+            # Probe this month's result count before attempting any record download
             month_cql = _build_cql(f'pd within "{m_start} {m_end}"')
             month_total = get_total_results_count(month_cql, consumer_key, consumer_secret)
 
             if month_total == 0:
+                # No patents published this month for this query — skip to the next month
                 continue
+                
             elif month_total <= 2000:
+                # Month fits within the API limit, we will fetch all records in one pass
                 print(f"[INFO] Year {year}, month {month}: fetching {month_total} results...")
                 ids.extend(search_patent_ids(month_cql, month_total))
+            
             else:
-                # Month still exceeds 2000 — slice by day
+                # Month still exceeds 2,000, we will apply the final slicing level: day by day.
+                # If a single day exceeds 2,000, the API will hard-truncate at 2,000
+                # and there is no deeper slicing level to fall back to.
                 print(f"[INFO] Year {year}, month {month}: {month_total} results (>2000). Slicing by day...")
                 for day in range(1, last_day + 1):
+                    # Build a single-day date range: pd within "YYYYMMDD YYYYMMDD"
                     day_str = f"{year}{month:02d}{day:02d}"
 
+                    # Probe this day's count before fetching
                     day_cql = _build_cql(f'pd within "{day_str} {day_str}"')
                     day_total = get_total_results_count(day_cql, consumer_key, consumer_secret)
 
                     if day_total > 2000:
+                        # Hard ceiling reached, the results will be silently truncated by the API.
+                        # This is logged as a warning but execution continues, accepting the loss.
                         print(f"[WARNING] Year {year}, month {month}, day {day}: "
                               f"{day_total} results exceed 2000. API cap truncating results.")
 
                     if day_total > 0:
+                        # Day has results within (or truncated by) the API limit are fetched
                         print(f"[INFO] Year {year}, month {month}, day {day}: fetching {day_total} results...")
                         ids.extend(search_patent_ids(day_cql, day_total))
 
@@ -694,8 +766,6 @@ def download_patent_ids(
         
         # Check if applicant_filter is not None before regex substitution
         applicant = re.sub(r"\*", "", applicant_filter) if applicant_filter else ""
-
-        # Save the final CSV
 
         # Save the final CSV
         if only_applicant:

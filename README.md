@@ -230,6 +230,112 @@ epo_api_codes.check_epo_quota(CONSUMER_KEY, CONSUMER_SECRET)
 df_ids = epo_api_codes.download_patent_ids(
     consumer_key    = CONSUMER_KEY,
     consumer_secret = CONSUMER_SECRET,
+    start_year      = 2015
+## API Constraints and How They Are Handled
+
+| Constraint | How it is handled |
+|---|---|
+| **2,000-result search cap** | Each query is split by year. Years with >2,000 results are sliced by month; months with >2,000 results are sliced by day. |
+| **Token expiry (900 s)** | A global token cache tracks token age and auto-refreshes with a 50-second safety margin before expiry. |
+| **10 req/min rate limit** | Conservative `time.sleep()` calls are placed between every paginated request and every batch fetch. |
+| **100-ID `/biblio` batch limit** | Phase 2 sends batches of exactly 100 IDs. Failed batches are retried up to 3 times, then each ID is retried individually to isolate failures. |
+| **Missing abstracts** | If `/biblio` returns no abstract, a fallback call is made to the dedicated `/abstract` endpoint, preferring English. |
+| **Weekly 4 GB data quota** | `check_epo_quota()` reads live quota headers before any run and prints a dashboard. The run continues regardless, but you are warned if the quota is exceeded. |
+| **Yearly data loss on long runs** | Each year's results are autosaved to `EPO_IDs_AutoSave_{year}.csv` immediately after processing. |
+| **Leading-zero Family_ID inconsistency** | `compare_patents.py` normalises all Family_IDs by stripping leading zeros before any comparison, so `"84545942"` and `"084545942"` are treated as the same family. |
+
+---
+
+## Output Files and Columns
+
+### Phase 1 output (both `epo_api_codes.py` and `epo_api_terms.py`)
+
+The output filename is generated automatically based on the parameters used:
+
+| Scenario | Filename |
+|---|---|
+| Codes only | `EPO_siRNA_IDs_{start}_{end}_codes_only.csv` |
+| Codes + applicant filter | `EPO_siRNA_IDs_{start}_{end}_codes_and_{Applicant}.csv` |
+| Applicant portfolio only | `EPO_siRNA_IDs_{start}_{end}_only_applicant_{Applicant}.csv` |
+| Terms only | `EPO_siRNA_IDs_{start}_{end}_terms_only.csv` |
+| Terms + applicant filter | `EPO_siRNA_IDs_{start}_{end}_terms_and_{Applicant}.csv` |
+
+**Columns:**
+
+| Column | Description |
+|---|---|
+| `Patent_ID` | DocDB identifier, e.g. `US.7056704.B2` |
+| `Family_ID` | EPO Simple Family identifier |
+| `Country` | Two-letter office code, e.g. `US`, `EP`, `WO` |
+
+### Phase 2 output (`epo_api_Metadata.py`)
+
+The output filename appends `_metadata` to the Phase 1 filename, e.g. `EPO_siRNA_IDs_2022_2025_terms_only_metadata.csv`.
+
+**Columns:**
+
+| Column | Description |
+|---|---|
+| `Patent_ID` | DocDB identifier |
+| `Country` | Two-letter office code |
+| `Number` | Patent number without punctuation |
+| `Kind` | Kind code, e.g. `B2`, `A1` |
+| `Family_ID` | EPO Simple Family identifier |
+| `Priority_Date` | Earliest priority date (`YYYYMMDD`) |
+| `Publication_Date` | Publication date (`YYYYMMDD`) |
+| `Applicant` | Pipe-separated list of applicant names with country codes |
+| `Title` | Invention title (English preferred) |
+| `Abstract` | Full abstract text (English preferred, HTML-stripped) |
+| `IPCs` | Comma-separated IPC classification codes |
+| `CPCs` | Comma-separated CPC classification codes |
+
+All CSVs use `;` as the separator and `utf-8-sig` encoding for Excel compatibility.
+
+---
+
+## Prerequisites and Installation
+
+Python 3.9+ is required. Install dependencies with:
+
+```bash
+pip install pandas requests numpy
+```
+
+To run the notebook interactively:
+
+```bash
+pip install jupyter
+jupyter notebook run_code.ipynb
+```
+
+---
+
+## Quick Start
+
+1. Obtain EPO OPS API credentials at [ops.epo.org](https://ops.epo.org).
+2. Open `run_code.ipynb`.
+3. Set your `CONSUMER_KEY` and `CONSUMER_SECRET` in the first cell.
+4. Run the cells sequentially: Phase 1 → Phase 2 → (optional) comparison.
+
+---
+
+## Detailed Usage
+
+### Phase 1a — Extraction by Classification Codes (`epo_api_codes.py`)
+
+```python
+import epo_api_codes
+
+CONSUMER_KEY    = "your_key"
+CONSUMER_SECRET = "your_secret"
+
+# Optional: check your weekly quota before starting
+epo_api_codes.check_epo_quota(CONSUMER_KEY, CONSUMER_SECRET)
+
+# Extract all siRNA-related patent families, 2015–2025
+df_ids = epo_api_codes.download_patent_ids(
+    consumer_key    = CONSUMER_KEY,
+    consumer_secret = CONSUMER_SECRET,
     start_year      = 2015,
     end_year        = 2025,
     applicant_filter = None,   # None = all applicants
@@ -291,7 +397,7 @@ df_metadata = fetch_biblio_from_csv(
 )
 ```
 
-Phase 2 is not subject to the 2,000-result search cap because it makes direct `/biblio` calls rather than search queries. The only practical upper limit is the weekly 4 GB data quota.
+Phase 2 is not subject to the 2,000-result search cap because it makes direct `/biblio` calls rather than search queries. However, the `/biblio` endpoint accepts a maximum of **100 patent IDs per request**, so the script automatically splits your ID list into batches of 100 and processes them sequentially. The overall practical limit on total patents fetchable in one run is your weekly 4 GB data quota.
 
 ---
 

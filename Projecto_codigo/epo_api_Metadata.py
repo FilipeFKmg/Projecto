@@ -211,6 +211,7 @@ def _parse_json_metadata(json_data: dict, results_list: list) -> None:
         json_data:    Parsed JSON response from a /biblio request.
         results_list: List to append parsed records to (mutated in place).
     """
+
     data    = json_data.get('ops:world-patent-data', {})
     ex_docs = data.get('exchange-documents', {})
     docs    = ex_docs.get('exchange-document', [])
@@ -306,6 +307,16 @@ def _parse_json_metadata(json_data: dict, results_list: list) -> None:
                 doc_number = _clean_val(d.get('doc-number', '')).replace(".", "")
                 kind       = _clean_val(d.get('kind', ''))
 
+        # Application reference: extract filing date to use as the true priority date fallback
+        a_ref = bib.get('application-reference', {})
+        a_d_ids = a_ref.get('document-id', [])
+        if isinstance(a_d_ids, dict):
+            a_d_ids = [a_d_ids]
+        app_date = ""
+        for d in a_d_ids:
+            if d.get('@document-id-type') == 'docdb':
+                app_date = _clean_val(d.get('date', ''))
+
         # Priority date: take the earliest date across all priority claims
         pri_claims     = bib.get('priority-claims', {})
         pri_claim_list = pri_claims.get('priority-claim', [])
@@ -317,9 +328,11 @@ def _parse_json_metadata(json_data: dict, results_list: list) -> None:
             if isinstance(c_d_ids, dict):
                 c_d_ids = [c_d_ids]
             for c_d in c_d_ids:
-                if c_d.get('@document-id-type') == 'docdb' and _clean_val(c_d.get('date')):
+                if _clean_val(c_d.get('date')):
                     dates_found.append(_clean_val(c_d.get('date')))
-        pri_date = min(dates_found) if dates_found else pub_date
+                    
+        # Use the earliest priority claim. If none exist, fallback to the filing (application) date.
+        pri_date = min(dates_found) if dates_found else (app_date if app_date else pub_date)
 
         # Classifications: separate CPC and IPC codes.
         # Codes with unrecognised scheme are added to both sets as a safe fallback.
@@ -432,6 +445,7 @@ def fetch_biblio_from_csv(
             f"https://ops.epo.org/3.2/rest-services/published-data/"
             f"publication/docdb/{','.join(batch)}/biblio"
         )
+
         
         success    = False
         batch_strikes = 0
@@ -449,6 +463,7 @@ def fetch_biblio_from_csv(
                     },
                     timeout=30
                 )
+
                 response_time = time.time() - request_start
 
                 if res.status_code == 200:
@@ -460,6 +475,7 @@ def fetch_biblio_from_csv(
                           f"(throttle strike {throttle_strikes})")
 
                     current_len = len(results)
+
                     _parse_json_metadata(res.json(), results)
 
                     # Attempt /abstract fallback for any patent with no abstract

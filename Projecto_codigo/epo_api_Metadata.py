@@ -13,7 +13,7 @@ Input:
     epo_api_ID.py. Separator must be ';'.
 
 Output columns:
-    Patent_ID        - docdb identifier, e.g. "US.7056704.B2"
+    Patent_ID        - docdb identifier, e.g. "US7056704B2"
     Country          - two-letter country/office code
     Number           - patent number without punctuation
     Kind             - kind code, e.g. "B2", "A1"
@@ -46,18 +46,6 @@ import re
 # token and its timestamp so it can be refreshed automatically before expiry.
 # =============================================================================
 TOKEN_CACHE = {'token': None, 'timestamp': 0}
-
-# =============================================================================
-# COUNTRY PRIORITY TABLE
-# Used in the final deduplication pass to prefer English-language documents
-# when the same family_id appears more than once in the biblio results.
-# Lower score = higher priority.
-# =============================================================================
-COUNTRY_PRIORITY = {
-    'US': 1, 'EP': 2, 'WO': 3, 'GB': 4,
-    'AU': 5, 'CA': 6, 'NZ': 7, 'IE': 8,
-}
-
 
 # =============================================================================
 # 1. AUTHENTICATION
@@ -188,7 +176,8 @@ def fetch_abstract_fallback(single_id: str, token: str) -> str:
                     return clean_text_for_csv(text)
                 return clean_text_for_csv(_clean_val(first))
 
-    except Exception:
+    except Exception as e:
+        print(f"  [WARNING] Abstract fallback failed for {single_id}: {type(e).__name__}: {e}")
         pass
 
     return "No abstract available in EPO database"
@@ -428,6 +417,14 @@ def fetch_biblio_from_csv(
 
     results = []
 
+    # Adaptive throttle state — tracks server stress signals across batches
+    throttle_strikes  = 0    # Counts 429/503 responses across batches
+    STRIKE_LIMIT      = 3    # Cooldown triggers after this many strikes
+    BASE_SLEEP        = 8    # Normal inter-batch pause (seconds)
+    current_sleep     = BASE_SLEEP
+    MAX_SLEEP         = 30   # Ceiling for the escalating inter-batch pause
+    COOLDOWN_DURATION = 600  # Full cooldown when strike limit is reached (seconds)
+
     for i in range(0, len(id_list), 100):
         batch      = id_list[i:i + 100]
         batch_num  = i // 100 + 1
@@ -435,12 +432,15 @@ def fetch_biblio_from_csv(
             f"https://ops.epo.org/3.2/rest-services/published-data/"
             f"publication/docdb/{','.join(batch)}/biblio"
         )
+        
         success    = False
+        batch_strikes = 0
 
         # Batch attempt — up to 3 retries before falling back to individual
         for attempt in range(3):
             try:
                 token = _get_valid_token(consumer_key, consumer_secret)
+                request_start = time.time()
                 res   = requests.get(
                     url,
                     headers={
@@ -449,8 +449,16 @@ def fetch_biblio_from_csv(
                     },
                     timeout=30
                 )
+                response_time = time.time() - request_start
 
                 if res.status_code == 200:
+
+                    if response_time > 10:
+                        batch_strikes    += 1
+                        throttle_strikes += 1
+                        print(f"  [SLOW] Batch {batch_num} took {response_time:.1f}s "
+                          f"(throttle strike {throttle_strikes})")
+
                     current_len = len(results)
                     _parse_json_metadata(res.json(), results)
 
@@ -469,14 +477,22 @@ def fetch_biblio_from_csv(
                     break
 
                 elif res.status_code == 404:
-                    # Batch not found — fall through to individual retry
+                    print(f"  [WARNING 404] Batch {batch_num} not found — "
+                          f"falling back to {len(batch)} individual requests.")
                     break
                 elif res.status_code == 403:
-                    print(f"  [WARNING 403] Access denied. Waiting 10 min (attempt {attempt+1}/3)...")
+                    print(f"  [WARNING 403] Access denied. Forcing full cooldown (attempt {attempt+1}/3)...")
+                    throttle_strikes = STRIKE_LIMIT  # Force cooldown after this batch
                     time.sleep(600)
                 elif res.status_code in [429, 503]:
-                    time.sleep(60 * (attempt + 1))
+                    batch_strikes    += 1
+                    throttle_strikes += 1
+                    wait_time = 60 * (attempt + 1)
+                    print(f"  [THROTTLE {res.status_code}] Strike {throttle_strikes} — waiting {wait_time}s...")
+                    time.sleep(wait_time)
                 else:
+                    print(f"  [WARNING {res.status_code}] Unexpected response on batch {batch_num} "
+                          f"(attempt {attempt+1}/3) — pausing 15s before retry.")
                     time.sleep(15)
 
             except Exception as e:
@@ -487,6 +503,9 @@ def fetch_biblio_from_csv(
         # Individual fallback: isolates whichever patent caused the batch failure
         if not success:
             print(f"  [INFO] Batch {batch_num} failed — retrying {len(batch)} IDs individually...")
+
+            pre_batch_len = len(results)
+
             for single_id in batch:
                 try:
                     token = _get_valid_token(consumer_key, consumer_secret)
@@ -524,9 +543,32 @@ def fetch_biblio_from_csv(
                     # Log but continue — one failed ID must not stop the run
                     print(f"  [SILENT LOSS] Could not fetch {single_id}: {e}")
 
+            lost = len(batch) - (len(results) - pre_batch_len)
+            if lost > 0:
+                print(f"  [WARNING] Batch {batch_num} — {lost}/{len(batch)} IDs "
+                      f"could not be fetched and are permanently lost.")
+
         print(f"[INFO] Batch {batch_num} complete — {len(results)} records fetched so far.")
-        # Pause between batches to stay within rate limit
-        time.sleep(8)
+
+        # Adaptive inter-batch pause — escalates when server shows strain,
+        # recovers gradually when batches succeed cleanly
+        if batch_strikes > 0:
+            current_sleep = min(current_sleep * 2, MAX_SLEEP)
+            print(f"  [ADAPTIVE] Sleep escalated to {current_sleep}s "
+                  f"({batch_strikes} stress signal(s) this batch).")
+        else:
+            current_sleep = max(BASE_SLEEP, current_sleep - 2)
+
+        # Full cooldown when strike limit is reached — resets session state
+        if throttle_strikes >= STRIKE_LIMIT:
+            print(f"\n[COOLDOWN] {throttle_strikes} throttle strikes — "
+                  f"pausing {COOLDOWN_DURATION // 60} min to reset EPO session...")
+            time.sleep(COOLDOWN_DURATION)
+            throttle_strikes = 0
+            current_sleep    = BASE_SLEEP
+            print(f"[COOLDOWN] Resuming from batch {batch_num + 1}...\n")
+        else:
+            time.sleep(current_sleep)
 
     # Build DataFrame
     if not results:

@@ -276,7 +276,7 @@ def _deduplicate_by_family(id_records: list, seen_families: dict = None) -> tupl
     Selects the single best patent representative for each patent family from
     a list of raw records collected across all independent queries.
 
-    Selection rule: COUNTRY_PRIORITY (US=1 > EP=2 > WO=3 > ...). This keeps
+    Selection rule: COUNTRY_PRIORITY (WO=1 > US=2 > EP=3 > ...). This keeps
     English-language documents as the preferred family member, reducing the
     need for translation fallbacks in Phase 2.
 
@@ -394,29 +394,29 @@ def download_patent_ids(
     # Returns a list of dicts: [{'id', 'family_id', 'country'}, ...]
     # =========================================================================
     def search_patent_ids(cql_query: str, total_patents: int) -> list:
-    """
-    Downloads all patent IDs matching cql_query by paginating through the
-    EPO OPS /search endpoint in blocks of 100 results.
+        """
+        Downloads all patent IDs matching cql_query by paginating through the
+        EPO OPS /search endpoint in blocks of 100 results.
 
-    The EPO API enforces two hard limits:
-      - 2,000 results maximum per query (enforced by search_with_slicing upstream)
-      - 100 results maximum per page
+        The EPO API enforces two hard limits:
+        - 2,000 results maximum per query (enforced by search_with_slicing upstream)
+        - 100 results maximum per page
 
-    We use 100 per page, the maximum the API allows, to minimise the number
-    of requests needed and reduce total extraction time.
+        We use 100 per page, the maximum the API allows, to minimise the number
+        of requests needed and reduce total extraction time.
 
-    Args:
-        cql_query:     Full CQL query string, already including the date filter.
-        total_patents: Result count from get_total_results_count(), used to
-                       calculate page boundaries and know when to stop paginating.
+        Args:
+            cql_query:     Full CQL query string, already including the date filter.
+            total_patents: Result count from get_total_results_count(), used to
+                        calculate page boundaries and know when to stop paginating.
 
-    Returns:
-        list[dict]: One dict per patent with keys 'id', 'family_id', 'country'.
-                    Cross-query duplicates are possible and resolved upstream
-                    by _deduplicate_by_family.
-    """
-    # Defensive cap: even if the caller passes a count above 2,000,
-    # the API will never return more than 2,000 results per query
+        Returns:
+            list[dict]: One dict per patent with keys 'id', 'family_id', 'country'.
+                        Cross-query duplicates are possible and resolved upstream
+                        by _deduplicate_by_family.
+        """
+        # Defensive cap: even if the caller passes a count above 2,000,
+        # the API will never return more than 2,000 results per query
         total_patents = min(total_patents, 2000)
         
         encoded_query     = urllib.parse.quote(cql_query)
@@ -474,7 +474,7 @@ def download_patent_ids(
                         break
 
                     elif res.status_code == 400:
-                        # Permanent error — malformed CQL rejected by the server.
+                        # Permanent error — the CQL query was rejected by the server due to a syntax error; no point retrying
                         # Return whatever records were collected before this failure
                         print(f"[SYNTAX ERROR 400] EPO rejected the query. Skipping block.")
                         return extracted_records
@@ -568,7 +568,7 @@ def download_patent_ids(
                             })
                             
             # Advance to the next page
-            start_index += 90
+            start_index += 100
             time.sleep(8)   # Conservative pause to stay within the ~10 req/min rate limit, tried 4 seconds got banned
 
         return extracted_records

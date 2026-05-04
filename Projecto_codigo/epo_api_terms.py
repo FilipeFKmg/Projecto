@@ -12,7 +12,7 @@ Output columns:
     Country    — two-letter country/office code, e.g. "US", "EP", "WO"
 
 Search strategy:
-    - Independent Query Architecture: each CPC/IPC code and text term is
+    - Independent Query Architecture: each text term is
       executed as a separate query and the results are merged. This avoids
       the 2000-result cap per query by narrowing each individual query.
     - Deep Slicing: queries that exceed 2000 results are automatically split
@@ -359,20 +359,31 @@ def download_patent_ids(
     # -------------------------------------------------------------------------
 
     if only_applicant:
+        # MODE 1: Applicant-Only Search
+        # We bypass the siRNA keyword search entirely to look up a specific company/person.
         if not applicant_filter:
+            # A targeted applicant search requires an actual name to search for.
             print("\n[ERROR] 'applicant_filter' must be provided if 'only_applicant' is True.")
-            # Cannot perform a search for a company without a name.
             return pd.DataFrame()
             
-        # Adds a placeholder to ensure the extraction loop runs once when searching by applicant.
+        # The downstream loop iterates over 'independent_queries' to merge with date/applicant filters.
+        # By providing an empty string placeholder, we ensure that loop executes exactly once 
+        # without attaching any specific keyword constraints
         independent_queries = [""]
     else:
+        # MODE 2: Technology-Specific Search (siRNA)
+        # We build separate, independent queries for each keyword. This fragmentation
+        # helps prevent any single query from hitting the API's 2000-result hard cap
         
-        # Excludes CPC codes unrelated to siRNA (Aptamers and Immunomodulatory) from each query
+        # EXCLUSIONS:
+        # Filter out false positives by excluding Cooperative Patent Classification (CPC) codes 
+        # specific to Aptamers (C12N15/115) and Immunomodulatory oligonucleotides (C12N15/117)
         exclusions = ' NOT (cpc="C12N15/115" OR cpc="C12N15/117")'
         
         independent_queries = []
 
+        # List of synonyms, acronyms, and expanded terms for siRNA technologies.
+        # Uses exact phrasing (quotes) and wildcards (*) to maximize recall.
         search_terms = [
             "siRNA*", "RNAi*", "dsRNA*", "iRNA*", "dsRNAi*", "oligonucleotide*",
             '"si-RNA"', '"ds RNA"',
@@ -387,7 +398,9 @@ def download_patent_ids(
             '"ribonucleic acid interference"',
             '"interfering ribonucleic acid"', '"interfering ribonucleic acids"'
         ]
-        
+
+        # Construct the final CQL (Contextual Query Language) string for each term.
+        # 'ta=' restricts the search to Title and Abstract to ensure higher relevance.
         for term in search_terms:
             independent_queries.append(f'(ta={term}{exclusions})')
 
@@ -589,13 +602,12 @@ def download_patent_ids(
     # handle queries that exceed the 2000-result API hard limit.
     # =========================================================================
     def search_with_slicing(base_cql: str, year: int) -> list:
-        
-        # Assembles the final CQL query string by combining the base code query,
+        # Assembles the final CQL query string by combining the base term query,
         # an optional applicant filter, and the date window for the current slice.
         # Three modes are supported:
         #   1. only_applicant  — ignores base_cql entirely; searches by applicant name only
-        #   2. applicant_filter (hybrid) — ANDs the code query with the applicant name
-        #   3. codes only      — base_cql + date window, no applicant constraint
+        #   2. applicant_filter (hybrid) — ANDs the term query with the applicant name
+        #   3. terms only      — base_cql + date window, no applicant constraint
         def _build_cql(date_condition: str) -> str:
             if only_applicant:
                 return f'pa="{applicant_filter}" AND {date_condition}'
@@ -781,11 +793,10 @@ def download_patent_ids(
         if only_applicant:
             out_filename = f'EPO_siRNA_IDs_{start_year}_{end_year}_only_applicant_{applicant}.csv'
         elif applicant_filter:
-            # Handles the hybrid case where both codes and applicant are used
-            out_filename = f'EPO_siRNA_IDs_{start_year}_{end_year}_codes_and_{applicant}.csv'
+            # Handles the hybrid case where both terms and applicant are used
+            out_filename = f'EPO_siRNA_IDs_{start_year}_{end_year}_terms_and_{applicant}.csv'
         else:
-            out_filename = f'EPO_siRNA_IDs_{start_year}_{end_year}_codes_only.csv'
-        final_df.to_csv(out_filename, index=False, sep=';', encoding='utf-8-sig')
+            out_filename = f'EPO_siRNA_IDs_{start_year}_{end_year}_terms_only.csv'
 
         elapsed = time.time() - start_time
         print(f"\n[SUCCESS] {len(final_df)} unique patent families saved to: {out_filename}")

@@ -1,0 +1,8 @@
+duplex_id,cell_line,timepoint_hrs,replicate,ic50_nM,ic50_unit_original,transfection_method,target_gene_name,patent_id,source_file
+AD-63851,Hep3B,,,0.027,nM,,KHK,EP3960860,EP3960860NWA2_table_08_T9_in_vitro_tables.csv
+AD-63820,Hep3B,,,0.01,nM,,KHK,EP3960860,EP3960860NWA2_table_08_T9_in_vitro_tables.csv
+AD-63853,Hep3B,,,0.067,nM,,KHK,EP3960860,EP3960860NWA2_table_08_T9_in_vitro_tables.csv
+AD-63839,Hep3B,,,0.015,nM,,KHK,EP3960860,EP3960860NWA2_table_08_T9_in_vitro_tables.csv
+AD-63854,Hep3B,,,0.075,nM,,KHK,EP3960860,EP3960860NWA2_table_08_T9_in_vitro_tables.csv
+AD-63855,Hep3B,,,0.0179,nM,,KHK,EP3960860,EP3960860NWA2_table_08_T9_in_vitro_tables.csv
+AD-63886,Hep3B,,,0.0829,nM,,KHK,EP3960860,EP3960860NWA2_table_08_T9_in_vitro_tables.csv

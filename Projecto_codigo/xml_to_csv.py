@@ -46,6 +46,7 @@ import glob
 import json
 import os
 import re
+import statistics
 import sys
 import time
 import traceback
@@ -499,6 +500,74 @@ def merge_multilevel_headers(header_rows: list[list[str]]) -> list[str]:
     return merged
 
 
+def check_value_name_plausibility(
+    sql_names:  list[str],
+    data_rows:  list[list[str]],
+    trace_file: str = "",
+    tbl_idx:    int = 0,
+) -> None:
+    """
+    Layer-2 sanity net: a column *name* makes a promise about its *values*.
+
+    A width check (header count == data count) catches a dropped or duplicated
+    column, but it cannot see a *swap* — if two same-count columns trade names,
+    every count still matches while the data is wrong.  The clearest swap to
+    catch is Avg <-> SD: an "...sd" column should hold values that are typically
+    SMALLER than its paired "...avg" column.  When the opposite is true across a
+    column, the two are almost certainly swapped.
+
+    This only LOGS a warning (and prints one); it never mutates the data, so a
+    false positive is harmless.  It is the net for the residual swap risk that
+    remains whenever the holistic LLM re-fusion path is used.
+    """
+    if not sql_names or not data_rows:
+        return
+
+    def _col_floats(ci: int) -> list[float]:
+        out: list[float] = []
+        for r in data_rows:
+            if ci < len(r):
+                try:
+                    out.append(float(str(r[ci]).strip()))
+                except (ValueError, TypeError):
+                    pass
+        return out
+
+    _AVG_SUF = re.compile(r"^(.*?)_(avg|mean|average)$")
+    _SD_SUF  = re.compile(r"^(.*?)_(sd|std|stdev|stddev)$")
+
+    pairs: dict[str, dict[str, int]] = {}
+    for i, name in enumerate(sql_names):
+        if not name:
+            continue
+        m = _AVG_SUF.match(name)
+        if m:
+            pairs.setdefault(m.group(1), {})["avg"] = i
+            continue
+        m = _SD_SUF.match(name)
+        if m:
+            pairs.setdefault(m.group(1), {})["sd"] = i
+
+    for prefix, idx in pairs.items():
+        if "avg" not in idx or "sd" not in idx:
+            continue
+        avg_vals = _col_floats(idx["avg"])
+        sd_vals  = _col_floats(idx["sd"])
+        if len(avg_vals) < 3 or len(sd_vals) < 3:
+            continue
+        med_avg = statistics.median(avg_vals)
+        med_sd  = statistics.median(sd_vals)
+        if med_sd > med_avg:
+            msg = (
+                f"Possible Avg/SD swap for '{prefix}': column "
+                f"'{sql_names[idx['sd']]}' (median {med_sd:g}) is larger than "
+                f"'{sql_names[idx['avg']]}' (median {med_avg:g}). An SD should be "
+                f"smaller than its mean — verify these two columns are not swapped."
+            )
+            log_trace(trace_file, f"PLAUSIBILITY TABLE {tbl_idx}", msg)
+            print(f"  [WARN] Table {tbl_idx}: {msg}")
+
+
 # ===========================================================================
 # Table extraction
 # ===========================================================================
@@ -559,6 +628,53 @@ def _resolve_colname(colname: str, colspec_map: dict) -> int | None:
     return None
 
 
+def _expand_single_row(row_el, ncols: int,
+                       colspec_map: dict | None = None) -> list[str]:
+    """
+    Expand ONE <row> into exactly *ncols* cells, honouring CALS column spans
+    (namest / nameend).
+
+    Used when a column-label row that lives in <tbody> is promoted to a header
+    row.  The data rows are always expanded to the full *ncols* width, so the
+    promoted header must be too — otherwise a label cell that spans several
+    columns (e.g. "Conc. (in nM)" covering the cell-line + duplex-id columns,
+    namest=col1 nameend=col2) is counted as a single cell and the whole header
+    ends up one (or more) columns short, misaligning every column name against
+    the data beneath it.
+
+    A spanned value is repeated across each column it covers (matching the
+    behaviour of expand_thead).  Missing trailing cells are padded with "".
+    """
+    cells: list[str] = []
+    entry_iter = iter(row_el.findall("entry"))
+    col = 0
+    while col < ncols:
+        try:
+            entry = next(entry_iter)
+        except StopIteration:
+            cells.append("")
+            col += 1
+            continue
+
+        value = element_text(entry).strip()
+
+        colspan = 1
+        if colspec_map is not None:
+            namest  = entry.get("namest")
+            nameend = entry.get("nameend")
+            if namest and nameend:
+                s = _resolve_colname(namest,  colspec_map)
+                e = _resolve_colname(nameend, colspec_map)
+                if s is not None and e is not None and e >= s:
+                    colspan = e - s + 1
+
+        for _ in range(colspan):
+            if col < ncols:
+                cells.append(value)
+                col += 1
+    return cells
+
+
 def extract_tables(xml_file: str) -> list[dict]:
     """
     Parse one XML file and return a list of table dicts (one per parent <table>
@@ -608,6 +724,7 @@ def extract_tables(xml_file: str) -> list[dict]:
             combined_headers:     list[list[str]] = []
             combined_rows:        list[list[str]] = []
             last_col0:            str             = ""   # fill-down tracker
+            tbody_label_promoted: bool            = False  # promote tbody label row once
 
             for tgroup in table_el.findall("tgroup"):
                 ncols       = int(tgroup.get("cols", 0))
@@ -661,8 +778,8 @@ def extract_tables(xml_file: str) -> list[dict]:
                 if pseudo_header_els and not combined_headers:
                     for row_el in pseudo_header_els:
                         cells = [
-                            _fix_ocr_concentration(element_text(e).strip())
-                            for e in row_el.findall("entry")
+                            _fix_ocr_concentration(c)
+                            for c in _expand_single_row(row_el, ncols, colspec_map)
                         ]
                         combined_headers.append(cells)
 
@@ -693,10 +810,13 @@ def extract_tables(xml_file: str) -> list[dict]:
 
                 if not pseudo_header_els and len(data_row_els) >= 2:
                     first_row_el  = data_row_els[0]
-                    first_cells   = [
-                        element_text(e).strip()
-                        for e in first_row_el.findall("entry")
-                    ]
+                    # Span-aware: expand to exactly `ncols` so a label row whose
+                    # leftmost cell spans several columns (e.g. "Conc. (in nM)"
+                    # covering the cell-line + duplex-id columns) stays aligned
+                    # with the data rows instead of coming out a column short.
+                    first_cells   = _expand_single_row(
+                        first_row_el, ncols, colspec_map
+                    )
                     first_nonempty = [c for c in first_cells if c]
                     all_text       = (
                         first_nonempty
@@ -714,11 +834,15 @@ def extract_tables(xml_file: str) -> list[dict]:
                     )
 
                     if all_text and first_not_id and has_num_after:
-                        promoted = [
-                            _fix_ocr_concentration(c) for c in first_cells
-                        ]
-                        combined_headers.append(promoted)
+                        # Each continuation tgroup repeats this label row, so it
+                        # must ALWAYS be stripped from the data — but contributed
+                        # to the header only once.
                         data_row_els = data_row_els[1:]
+                        if not tbody_label_promoted:
+                            combined_headers.append(
+                                [_fix_ocr_concentration(c) for c in first_cells]
+                            )
+                            tbody_label_promoted = True
 
                 # ── Expand data rows ─────────────────────────────────────────
                 data_rows = expand_rows(data_row_els, ncols, colspec_map)
@@ -942,8 +1066,9 @@ def repair_headers_with_ai(
     Use the Groq LLM to collapse a multi-row header grid into a single flat
     list of human-readable column names.
 
-    Returns the repaired list (length == ncols), or None if the LLM could not
-    be reached or returned an unusable result (caller falls back to
+    Returns the model's flat list of names (whose length the caller validates
+    against the real data-row width), or None if the LLM could not be reached
+    or returned an unusable result (caller falls back to
     merge_multilevel_headers).
 
     This is Pass 1 (structure repair).  The repaired strings are then passed
@@ -1020,15 +1145,17 @@ def repair_headers_with_ai(
             if not isinstance(repaired, list):
                 raise ValueError("LLM returned non-list JSON.")
 
-            # Pad or truncate to exactly ncols
+            # Return EXACTLY what the model produced — do NOT pad or truncate.
+            # Silently padding a short list up to ncols appends the blank at the
+            # END, which shifts every real name one column left of its data
+            # (the exact misalignment bug this guards against). The caller
+            # validates this length against the real data-row width and falls
+            # back to a width-checked alternative if it does not match.
             repaired = [str(x) for x in repaired]
-            if len(repaired) < ncols:
-                repaired += [""] * (ncols - len(repaired))
-            else:
-                repaired = repaired[:ncols]
 
-            log_trace(trace_file, f"REPAIR ATTEMPT {attempt} - SUCCESS",
-                      f"Repaired {ncols} column(s):\n" +
+            log_trace(trace_file, f"REPAIR ATTEMPT {attempt} - PARSED",
+                      f"LLM returned {len(repaired)} name(s) "
+                      f"(header rows imply {ncols}):\n" +
                       "\n".join(f"  [{i:2d}] {h!r}" for i, h in enumerate(repaired)))
             return repaired
 
@@ -1961,25 +2088,62 @@ def convert_directory(
 
         for tbl_idx, tbl in enumerate(tables):
             raw_header_rows = tbl.get("headers", [])
-            # Pass 1: ask Groq to repair/merge headers.
-            # repair_headers_with_ai returns None for clean single-row headers
-            # (where the first data row has numeric values), so there is no
-            # wasted API call for tables that are already well-formed.
-            repaired = repair_headers_with_ai(
-                header_rows = raw_header_rows,
-                sample_rows = tbl.get("rows", [])[:4],
-                trace_file  = file_log,
-                table_title = tbl.get("title", ""),
-            )
-            if repaired is not None:
-                tbl["headers"] = [repaired]
-                log_trace(file_log, f"REPAIR TABLE {tbl_idx}",
-                          f"AI repair applied:\n" +
-                          "\n".join(f"  [{i:2d}] {h!r}" for i, h in enumerate(repaired)))
+            data_rows       = tbl.get("rows", [])
+
+            # Ground truth for the column count is the DATA itself, not the
+            # header and not the LLM. Every data row in a CALS table has one
+            # cell per column, so the header must have exactly this many names;
+            # any other count means a column was dropped, added, or reordered
+            # (which silently misaligns every value).
+            data_width = max((len(r) for r in data_rows), default=0)
+
+            # Strategy — deterministic span-expansion OWNS the grid.
+            # merge_multilevel_headers concatenates the multi-row header
+            # column-by-column, so it can never drop, add, or reorder a column:
+            # for well-formed CALS the column count and positions are exact.
+            # We therefore try it FIRST and accept it whenever its width matches
+            # the data. The 70B LLM is spent only when the spans cannot account
+            # for every data column (broken CALS markup, or a header that the
+            # parser left inside <tbody>).
+            arith = merge_multilevel_headers(raw_header_rows)
+
+            if data_width == 0:
+                # No data rows to verify against — use the deterministic merge.
+                tbl["headers"] = [arith]
+                log_trace(file_log, f"HEADER TABLE {tbl_idx}",
+                          "No data rows; deterministic merge used unchecked.")
+            elif len(arith) == data_width:
+                tbl["headers"] = [arith]
+                log_trace(file_log, f"HEADER TABLE {tbl_idx}",
+                          f"Deterministic merge owns the grid: {data_width} "
+                          f"column(s), aligned to data width.")
             else:
-                tbl["headers"] = [merge_multilevel_headers(raw_header_rows)]
-                log_trace(file_log, f"REPAIR TABLE {tbl_idx}",
-                          "No repair needed (or fallback); merge_multilevel_headers used.")
+                # Spans don't cover every data column → spend the 70B model.
+                repaired = repair_headers_with_ai(
+                    header_rows = raw_header_rows,
+                    sample_rows = data_rows[:4],
+                    trace_file  = file_log,
+                    table_title = tbl.get("title", ""),
+                )
+                if repaired is not None and len(repaired) == data_width:
+                    tbl["headers"] = [repaired]
+                    log_trace(file_log, f"HEADER TABLE {tbl_idx}",
+                              f"Deterministic merge width {len(arith)} != data "
+                              f"width {data_width}; 70B re-fusion matched the "
+                              f"data width and was used.")
+                else:
+                    # Neither method aligns to the data. Do NOT ship a shifted
+                    # header — emit positional names and flag for manual review.
+                    tbl["headers"] = [[f"_col_{i}" for i in range(data_width)]]
+                    llm_len = len(repaired) if repaired is not None else "None"
+                    log_trace(file_log, f"HEADER TABLE {tbl_idx} - UNRESOLVED",
+                              f"Header could not be aligned to data: "
+                              f"merge={len(arith)}, LLM={llm_len}, "
+                              f"data={data_width}. Emitted positional names "
+                              f"(_col_0..) — NEEDS REVIEW.")
+                    print(f"  [WARN] Table {tbl_idx}: header could not be aligned "
+                          f"to {data_width} data columns; emitted positional "
+                          f"names. See {os.path.basename(file_log)}.")
 
         # merged_flat[i] is the (now single-row) header list for tables[i]
         merged_flat: list[list[str]] = [
@@ -2022,6 +2186,13 @@ def convert_directory(
         # that column's SQL name with duplex_id.
 
         _AD_RE = re.compile(r"^AD-\d+", re.IGNORECASE)
+        # A value column qualified by an assay day or timepoint, e.g.
+        # "Day 3 1nM", "72 hr 10nM". The AI normalizer sometimes drops the
+        # day/time qualifier ("Day 3 1nM" -> "conc_1_nm"), collapsing several
+        # timepoints into one name and losing the day. These headers are
+        # unambiguous, so we normalise them deterministically (Fix 6 below).
+        _DAYTIME_RE = re.compile(r'\b(day\s*\d+|\d+\s*(?:hr|hour|h|wk|week)s?)\b',
+                                 re.IGNORECASE)
 
         for tbl_idx, tbl in enumerate(tables):
             mf      = merged_flat[tbl_idx]   # flat merged headers for this table
@@ -2033,16 +2204,36 @@ def convert_directory(
                 for cell in mf
             ]
 
-            # Fix 4 – detect missing duplex_id from first data column
-            if sql_flat and data:
-                first_col_values = [row[0] for row in data if row and row[0].strip()]
-                ad_hits = sum(1 for v in first_col_values if _AD_RE.match(v))
-                if (
-                    ad_hits >= max(1, len(first_col_values) // 2)
-                    and sql_flat[0] != "duplex_id"   # ← was: sql_flat[0] in ("", "_col_0", "col0", "col_0")
-                    and "duplex_id" not in sql_flat   # don't add a second duplex_id column
-                ):
-                    sql_flat[0] = "duplex_id"
+            # Fix 6 – day/time-qualified value columns (e.g. "Day 3 1nM").
+            # The AI normalizer can drop the day/time qualifier and emit
+            # "conc_1_nm", merging three timepoints into one name. These headers
+            # are unambiguous, so normalise them deterministically — which keeps
+            # the day: basic_sql_normalize("Day 3 1nM") -> "day_3_1nm".
+            for _i, cell in enumerate(mf):
+                if cell.strip() and _DAYTIME_RE.search(cell):
+                    sql_flat[_i] = basic_sql_normalize(cell)
+
+            # Fix 4 – detect the duplex_id column by VALUE, in ANY column.
+            # The duplex column is not always the first data column (a cell-line
+            # column may precede it) and its header may be unusable (it sat under
+            # a spanning label such as "Conc. (in nM)", which leaves both the
+            # cell-line and duplex columns unnamed). Scan every column; the first
+            # whose values are mostly AD-\d+ duplex IDs becomes duplex_id, unless
+            # a duplex_id column is already present.
+            if sql_flat and data and "duplex_id" not in sql_flat:
+                for _ci in range(len(sql_flat)):
+                    col_vals = [row[_ci] for row in data
+                                if _ci < len(row) and str(row[_ci]).strip()]
+                    if not col_vals:
+                        continue
+                    ad_hits = sum(1 for v in col_vals if _AD_RE.match(str(v)))
+                    if ad_hits >= max(1, len(col_vals) // 2):
+                        if sql_flat[_ci] != "duplex_id":
+                            log_trace(file_log, f"FIX4 TABLE {tbl_idx}",
+                                      f"col {_ci} holds AD-\\d+ duplex IDs — "
+                                      f"renamed '{sql_flat[_ci]}' to 'duplex_id'")
+                            sql_flat[_ci] = "duplex_id"
+                        break
 
             # Fix 5 – normalise any header that contains the word "duplex" -> duplex_id
             #
@@ -2088,6 +2279,11 @@ def convert_directory(
 
             # Store as a single sql_headers row (the merged representation)
             tbl["sql_headers"] = [deduped_flat]
+
+            # Layer-2 net: a width check cannot see a column SWAP. Verify the
+            # finalized names against their values (e.g. an "...sd" column must
+            # be smaller than its paired "...avg"); warn if they look swapped.
+            check_value_name_plausibility(deduped_flat, data, file_log, tbl_idx)
 
         # ── Write outputs ────────────────────────────────────────────────────
         write_context_file(text_content, ctx_path)

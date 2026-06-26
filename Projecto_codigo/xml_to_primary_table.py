@@ -38,8 +38,13 @@ THREE OUTPUT TABLES
    cell_line            – cell line used in the viability assay
    day                  – assay day as integer (NULL when not stated)
    dose_nM              – siRNA dose in nM
-   viability_percent    – % viable cells relative to mock
-   viability_sd         – standard deviation of viability_percent
+   viability_value      – viability as reported in the patent (raw, NOT rescaled;
+                          interpret via viability_basis)
+   viability_sd         – standard deviation of viability_value
+   viability_basis      – what the value is relative to (controlled vocabulary,
+                          e.g. fraction_of_non_targeting); 'unknown' if unstated
+   viability_relative_to– reference compound the value is normalised to
+                          (e.g. AD-1955); NULL if none/unknown
    target_gene_name     – HUGO gene name
    patent_id            – EP number derived from filename
    source_file          – basename of the originating CSV
@@ -85,6 +90,7 @@ from __future__ import annotations
 import csv
 import glob
 import hashlib
+import json
 import os
 import re
 import time
@@ -140,13 +146,23 @@ VIABILITY_FIELDS = [
     "cell_line",
     "day",
     "dose_nM",
-    "viability_percent",
+    "viability_value",
     "viability_sd",
+    "viability_basis",
+    "viability_relative_to",
     "transfection_method",
     "target_gene_name",
     "patent_id",
     "source_file",
 ]
+
+# Schema for quarantined rows: every column any extractor can produce, plus the
+# reason the row was held aside. A superset so a quarantined knockdown / IC50 /
+# viability row all fit one review file without losing fields.
+_FLAGGED_FIELDS = (
+    ["flag_reason"]
+    + list(dict.fromkeys(PRIMARY_FIELDS + IC50_FIELDS + VIABILITY_FIELDS))
+)
 
 # Fields that carry sequence / annotation data (no measurement).
 _SEQ_FIELDS = {"sense_sequence", "antisense_sequence",
@@ -165,7 +181,7 @@ _ID_SUBSTRINGS = frozenset({"oligo", "seq_id", "sense", "antisense", "duplex"})
 # Numeric fields rounded to 4 dp in output.
 _NUMERIC_FIELDS_PRIMARY    = {"dose_nM", "inhibition_percent", "value_sd"}
 _NUMERIC_FIELDS_IC50       = {"timepoint_hrs", "ic50_nM"}
-_NUMERIC_FIELDS_VIABILITY  = {"day", "dose_nM", "viability_percent", "viability_sd"}
+_NUMERIC_FIELDS_VIABILITY  = {"day", "dose_nM", "viability_value", "viability_sd"}
 
 # ---------------------------------------------------------------------------
 # Groq client pool
@@ -202,6 +218,22 @@ _VALIDATION_FAILURES: list[list] = [[]]
 # Plausible upper bound for a concentration in nM (10 mM). Above this a "dose" or
 # IC50 is almost certainly a mis-mapped value, not a real concentration.
 _MAX_DOSE_NM = 1e7
+
+# Plausible ceiling for a knockdown/inhibition percentage. 100% = complete
+# knockdown; a reading can sit a little above that from assay noise, but a value
+# in the hundreds or thousands is a mis-derived number (e.g. an IC50 wrongly
+# pushed through a "(100 - value) * 100" formula), never a real measurement.
+_MAX_INHIBITION_PCT = 200.0
+# Lower bound. A negative inhibition is genuine gene upregulation and must be
+# kept (e.g. a control fraction of 2.46 -> -146 %, observed in real data). But a
+# value far below this floor cannot be real: it comes from a corrupt source cell
+# whose decimal point was lost (e.g. "0.36" written as "036" -> read as 36 ->
+# (1 - 36) * 100 = -3500 %). The floor is set well below the largest plausible
+# upregulation so real outliers survive while corrupted cells are dropped. It is
+# a backstop, not a full corruption filter: a dropped decimal that happens to
+# stay in range cannot be detected here. Tune if a corpus shows stronger real
+# upregulation.
+_MIN_INHIBITION_PCT = -200.0
 
 
 def _init_clients(api_keys: list[str] | str | None) -> None:
@@ -325,9 +357,11 @@ def _validate_rows(rows: list[dict], fields: list[str], numeric_fields: set,
 
     A failing cell is set to None (blocked) so it cannot pollute the merge or the
     output, and a (patent_id, source_file, column, value, reason) record is added
-    to the validation manifest. Ranges for inhibition/viability percentages are
-    deliberately NOT enforced, so genuine upregulation outliers (large negative
-    inhibition) are preserved rather than discarded."""
+    to the validation manifest. For inhibition % both an UPPER ceiling (non-
+    physical mis-derived values such as an IC50 forced through a knockdown
+    formula) and a LOWER floor (corrupt source cells with a dropped decimal point,
+    e.g. "036" read as 36) are enforced; the floor sits well below the largest
+    plausible upregulation so genuine negative-inhibition outliers are kept."""
     pid        = _derive_patent_id(source_file)
     seq_cols   = {f for f in fields if "sequence" in f}
     oligo_cols = _OLIGO_ID_FIELDS & set(fields)
@@ -367,6 +401,15 @@ def _validate_rows(rows: list[dict], fields: list[str], numeric_fields: set,
                 continue
             if col in ("dose_nM", "ic50_nM") and not (0 <= x <= _MAX_DOSE_NM):
                 _flag(col, v, "dose/IC50 out of plausible range (<0 or >10 mM)")
+                row[col] = None
+            elif col == "inhibition_percent" and x > _MAX_INHIBITION_PCT:
+                _flag(col, v, "inhibition % above physical ceiling — mis-derived "
+                              "(e.g. an IC50 pushed through a knockdown formula)")
+                row[col] = None
+            elif col == "inhibition_percent" and x < _MIN_INHIBITION_PCT:
+                _flag(col, v, "inhibition % below plausible floor — corrupt source "
+                              "cell (e.g. a control fraction with a dropped decimal "
+                              "point) pushed through the knockdown formula")
                 row[col] = None
             elif col in ("value_sd", "viability_sd") and x < 0:
                 _flag(col, v, "negative standard deviation")
@@ -439,6 +482,179 @@ def _detect_transfection_method(context_text: str) -> str | None:
     return None
 
 
+# Upper-case tokens that look like a gene symbol but are assay / lab / format
+# terms — used to reject such look-alikes when verifying a resolved gene.
+_NON_GENE_TOKENS = frozenset({
+    "RNA", "DNA", "SIRNA", "DSRNA", "MRNA", "SHRNA", "MIRNA", "CRNA", "NTC", "ASO",
+    "GAPMER", "IC50", "EC50", "CC50", "TC50", "GI50", "KD", "KI", "PBS", "HBSS",
+    "DMEM", "FBS", "FCS", "DMSO", "HELA", "HEPG2", "HEP3B", "HEK", "COS", "CHO",
+    "NIH", "HUH", "HUH7", "PHH", "UTR", "ORF", "CDS", "NT", "BP", "KB", "MB", "AD",
+    "SD", "SEM", "ID", "NO", "PD", "PK", "IV", "SC", "IP", "PO", "US", "EP", "WO",
+    "JP", "CN", "KR", "DE", "GB", "FR", "EDTA", "ATP", "GTP", "PCR", "QPCR",
+    "ELISA", "FACS", "GFP", "LNP", "GALNAC", "PS", "OME", "MOE", "LNA", "UNA",
+    "FANA", "CET", "SEQ", "FIG", "TABLE", "NM", "UM", "PM", "MM", "FM", "UG", "MG",
+    "NG", "PCT", "CSV", "XML", "API", "RT", "PBMC", "SAR", "WT", "KO", "UPLC",
+    "HPLC", "LCMS", "PEG", "AAV", "CMV",
+})
+
+# Genes that are siRNA CONTROLS, not therapeutic targets — used to reject a
+# resolver answer that mistakenly names a control gene.
+_CONTROL_GENES = frozenset({
+    "PLK1", "KIF11", "EG5", "GAPDH", "LUCIFERASE", "LUC", "PPIB", "SSB", "AHA1",
+    "ACTB", "BACTIN", "HPRT", "HPRT1", "TUBB", "B2M", "SCRAMBLED", "NTC", "NEG",
+})
+
+
+def _resolve_patent_target_gene(context_texts: list[str], trace_file: str) -> str | None:
+    """Resolve the SINGLE therapeutic target gene for a patent from its table
+    titles/captions, using the LLM as an identifier.
+
+    Free-text gene extraction by regex cannot tell the target gene from a control
+    gene (PLK1, luciferase), a disease/cell-line word (uveal melanoma), an assay
+    term (IC50), or an OCR typo — and a single screen table mixes target duplexes
+    with control duplexes, so no one gene labels a whole table. Identifying the
+    target is a judgment task, so the LLM reads the collected titles and names the
+    one target. The answer is verified: it must be a plausible symbol, must not be
+    a known control gene, and must actually appear in the titles (no
+    hallucination). Returns None when unsure or multi-target, leaving the existing
+    per-table genes and propagation untouched."""
+    titles: list[str] = []
+    for ct in context_texts:
+        for ln in (ct or "").splitlines():
+            ln = ln.strip()
+            if ln:
+                titles.append(ln[:200])
+    if not titles:
+        return None
+    joined = "\n".join(dict.fromkeys(titles))[:6000]   # dedupe, preserve order, cap
+
+    prompt = f"""The lines below are TITLES and captions of tables from ONE patent that
+describes siRNA / dsRNA molecules. Identify the SINGLE human gene that the
+siRNAs are designed to silence — the therapeutic target.
+
+RULES:
+- Output ONLY one JSON object: {{"gene": "SYMBOL"}} or {{"gene": null}}.
+- Use the official upper-case gene symbol (e.g. ANGPTL3, GNAQ, PCSK9, TTR).
+- IGNORE control siRNAs and their genes (PLK1, KIF11, luciferase, GAPDH,
+  non-targeting / scrambled) — a control is NOT the target.
+- IGNORE cell-line names, disease names (e.g. uveal melanoma), and assay terms
+  (IC50, EC50, viability).
+- If there are several distinct targets, or you cannot tell, return {{"gene": null}}.
+
+Titles:
+{joined}"""
+
+    raw = _llm_chat(prompt, max_tokens=80)
+    log_trace(trace_file, "PATENT GENE RESOLVER RAW", raw)
+    obj = _parse_json_object(raw)
+    if not obj:
+        return None
+    gene = obj.get("gene")
+    if not isinstance(gene, str):
+        return None
+    gene = gene.strip().upper()
+    if not re.fullmatch(r"[A-Z][A-Z0-9]{1,9}", gene):
+        return None                                   # not a plausible symbol
+    if gene in _CONTROL_GENES or gene in _NON_GENE_TOKENS:
+        return None                                   # it named a control / non-gene
+    if gene not in joined.upper():
+        return None                                   # not actually in the titles
+    return gene
+
+
+# Controlled vocabulary for viability_basis — a small fixed set so the column is
+# groupable/filterable across the corpus (free text would fragment into many
+# spellings and become useless for ML). The pipeline NEVER rescales the value;
+# this label is what lets a downstream, versioned transform normalise correctly
+# per row (e.g. fraction→percent only where basis says fraction).
+_VIABILITY_BASIS_VALUES = (
+    "fraction_of_non_targeting",   # value / non-targeting control; control ≈ 1.0
+    "percent_of_non_targeting",    # value / non-targeting control × 100; ≈ 100
+    "fraction_of_mock",            # relative to mock / untreated cells; ≈ 1.0
+    "percent_of_mock",             # relative to mock / untreated cells; ≈ 100
+    "raw",                         # absolute readout (RLU / fluorescence / OD / counts)
+    "unknown",                     # context does not state a normalisation
+)
+
+
+def _resolve_viability_basis(context_text: str,
+                             trace_file: str) -> tuple[str, str | None]:
+    """Identify WHAT a viability table's values are normalised against, as a
+    label — never a transformed value.
+
+    Mirrors _resolve_patent_target_gene: the LLM reads the assay description and
+    picks from a fixed vocabulary; the named reference compound (e.g. 'AD-1955')
+    is returned separately and verified to actually occur in the text (no
+    hallucinated reference). Returns ('unknown', None) when the context is silent
+    — for a foundation-model dataset an honest gap beats a guess, since a guessed
+    basis would systematically mislabel a normalisation the model then learns."""
+    ctx = (context_text or "").strip()
+    if not ctx:
+        return "unknown", None
+
+    allowed = ", ".join(_VIABILITY_BASIS_VALUES)
+    prompt = f"""The text below describes how CELL VIABILITY was measured and normalised in
+ONE siRNA/dsRNA patent assay. Identify what the reported viability numbers are
+expressed RELATIVE TO. Do NOT compute or transform any value.
+
+Return ONLY one JSON object:
+  {{"basis": "<one of: {allowed}>", "relative_to": "<reference compound or null>"}}
+
+Guidance:
+- "normalized to / compared to a non-targeting (scrambled / negative-control)
+  duplex" → fraction_of_non_targeting (values near 1.0) OR
+  percent_of_non_targeting (values near 100). Judge fraction vs percent from the
+  scale the text describes.
+- "relative to mock / untreated / naive / vehicle cells" → fraction_of_mock or
+  percent_of_mock (same fraction-vs-percent judgement).
+- absolute readout (raw RLU / fluorescence / OD / cell counts) → raw.
+- if no normalisation basis is stated → unknown.
+- relative_to: the named control/reference duplex (e.g. "AD-1955"), else null.
+
+Assay description:
+{ctx[:3000]}"""
+
+    raw = _llm_chat(prompt, max_tokens=80)
+    log_trace(trace_file, "VIABILITY BASIS RAW", raw)
+    obj = _parse_json_object(raw)
+    if not isinstance(obj, dict):
+        return "unknown", None
+
+    basis = str(obj.get("basis") or "").strip().lower()
+    if basis not in _VIABILITY_BASIS_VALUES:
+        basis = "unknown"
+
+    ref = obj.get("relative_to")
+    if isinstance(ref, str):
+        ref = ref.strip()
+        # Reject empties and any reference the model invented (must be in text).
+        if ref.lower() in ("", "null", "none", "n/a") or ref.upper() not in ctx.upper():
+            ref = None
+    else:
+        ref = None
+
+    return basis, ref
+
+
+def _apply_target_gene(gene: str, *row_lists: list[dict]) -> int:
+    """Set the patent's single target gene on every NON-CONTROL duplex.
+
+    Control duplexes (detected by _CONTROL_ID_RE on the duplex_id) are left
+    untouched — a non-targeting control silences nothing, and a positive control
+    such as a PLK1 siRNA targets its own gene, not the patent's target. Because a
+    patent has one therapeutic target, this overrides any per-table value that
+    disagrees (e.g. a control gene wrongly read from a caption)."""
+    n = 0
+    for rows in row_lists:
+        for r in rows:
+            if _CONTROL_ID_RE.search(str(r.get("duplex_id") or "")):
+                continue
+            if r.get("target_gene_name") != gene:
+                r["target_gene_name"] = gene
+                n += 1
+    return n
+
+
 _SENSE_OLIGO_RE     = re.compile(r'\bsense[_\s]?oligo[_\s]?(id|num|number)?\b', re.IGNORECASE)
 _ANTISENSE_OLIGO_RE = re.compile(r'\bantisense[_\s]?oligo[_\s]?(id|num|number)?\b', re.IGNORECASE)
 _DUPLEX_COL_RE      = re.compile(r'\bduplex[_\s]?(id|num|number)?\b', re.IGNORECASE)
@@ -447,9 +663,13 @@ _DUPLEX_COL_RE      = re.compile(r'\bduplex[_\s]?(id|num|number)?\b', re.IGNOREC
 # Table-type detection
 # ---------------------------------------------------------------------------
 
+# Matches viability wording in a title ("cell viability") AND a snake_case column
+# name ("viability_pct", "cell_viability"). Lookarounds treat _, -, space, and
+# string ends as boundaries — a plain \b fails on underscores because underscore
+# is a word character (so "viability_pct" would not match with \b).
 _VIABILITY_TITLE_RE = re.compile(
-    r'\b(viab(le|ility)|viable|CellTiter|cytotox|% viable|percent viable'
-    r'|cell\s+survival|cell\s+death)\b',
+    r'(?<![a-z0-9])(viab(?:le|ility)?|celltiter|cytotox\w*|% ?viable|'
+    r'percent[\s_]+viable|cell[\s_]+(?:survival|death|viability))(?![a-z0-9])',
     re.IGNORECASE,
 )
 
@@ -590,6 +810,293 @@ def _read_csv_headers(csv_path: str) -> list[str]:
 def _has_ic50_column(headers: list[str]) -> bool:
     """True if the table carries a dedicated IC50 value column (e.g. 'ic50_nM')."""
     return any(_IC50_COL_RE.search(h) for h in headers)
+
+
+# A column whose NAME marks it as knockdown/inhibition data (percent inhibition,
+# knockdown, silencing, mRNA/message remaining, relative expression).
+_KNOCKDOWN_NAMED_RE = re.compile(
+    r'(inhib|knock[\s_]?down|silenc|remain|'
+    r'(?:m|messen\w*|transcript)?rna[\s_]*(?:remain|level)|'
+    r'percent[\s_]*(?:inhib|knock|silenc|remain)|'
+    r'\bpct[\s_]*(?:inhib|knock|silenc|remain)|'
+    r'(?:rel|relative|norm|normali[sz]ed)[\s_]*(?:expr|express|mrna|message|activity))',
+    re.IGNORECASE,
+)
+
+# A dose-LABELLED average/value column (e.g. '10nM_AVG', '0.1nM_AVG', 'avg_10nm',
+# 'mean', or a bare dose value like '10nM'/'500pM'). Knockdown screens routinely
+# report activity in such columns with NO 'inhibition' keyword, so this is the
+# second half of the knockdown-data test.
+_AVG_VALUE_RE = re.compile(
+    r'(\bavg\b|\bmean\b|_avg\b|\bavg_|_mean\b|\bmean_|'
+    r'[\d.]+[\s_]?[np]m\b|\bconc[\s_]?\d)',
+    re.IGNORECASE,
+)
+
+
+def _has_viability_column(headers: list[str]) -> bool:
+    """True if a column name marks cell-viability data (viab/CellTiter/cytotox…)."""
+    return any(_VIABILITY_TITLE_RE.search(h) for h in headers)
+
+
+# Cytokine / innate-immune readout columns. A table whose value columns are these
+# measures an IMMUNOSTIMULATION response (e.g. % IFN-alpha, % TNF-alpha, IL-6),
+# NOT target knockdown. This is used only as a deterministic CROSS-CHECK against
+# the LLM's table-type call: when the two disagree the table is flagged for human
+# review (failed_tables manifest) — it never silently overrides the LLM, so a term
+# this list does not know about simply means no flag, never a wrong drop.
+_IMMUNE_COL_RE = re.compile(
+    r'(?<![a-z0-9])('
+    r'ifn|interferon|tnf|il[-_]?\d{1,2}|cytokine|chemokine|'
+    r'cxcl\d|ccl\d|isg\d|oas\d?|pkr|mx[12]|ifit\d|'
+    r'immunostim|innate'
+    r')(?![a-z0-9])',
+    re.IGNORECASE,
+)
+
+
+def _looks_like_immune_table(headers: list[str]) -> bool:
+    """Deterministic sniff: do the columns look like cytokine / innate-immune
+    readouts rather than target knockdown? Advisory only — used to cross-check the
+    LLM, never to decide the table's fate."""
+    return bool(headers) and any(_IMMUNE_COL_RE.search(h) for h in headers)
+
+
+# In-vivo (animal study) column markers: dosing by body weight (mg/kg), a tissue
+# the target mRNA was measured in (liver, kidney, serum…), or an animal/species.
+# In-vivo knockdown is a DIFFERENT measurement from an in-vitro screen (mg/kg vs
+# nM, tissue vs cell line) and usually does not belong in an in-vitro dataset.
+# Like the immune sniff, this is advisory only: a disagreement with the LLM's
+# call is flagged for review, never silently acted on. "day"/timepoint terms are
+# deliberately excluded because in-vitro viability tables use day_x_ynm columns.
+_INVIVO_COL_RE = re.compile(
+    r'(?<![a-z0-9])('
+    r'mg[-_/]?kg|mpk|'                                            # dose per body weight
+    r'liver|hepatic|kidney|renal|spleen|serum|plasma|tumou?r|'    # tissues / matrices
+    r'muscle|lung|jejunum|duodenum|'
+    r'mouse|mice|murine|rat|cyno|cynomolgus|monkey|primate|nhp|'  # animals
+    r'animal|in[-_]?vivo|subcutaneous'
+    r')(?![a-z0-9])',
+    re.IGNORECASE,
+)
+
+
+def _looks_like_invivo_table(headers: list[str]) -> bool:
+    """Deterministic sniff: do the columns look like an in-vivo animal study
+    (mg/kg dosing, a tissue matrix, an animal/species) rather than an in-vitro
+    screen? Advisory only — cross-checks the LLM, never decides the table's fate."""
+    return bool(headers) and any(_INVIVO_COL_RE.search(h) for h in headers)
+
+
+def _has_knockdown_data(headers: list[str]) -> bool:
+    """True if the table carries a genuine knockdown/inhibition measurement column.
+
+    Knockdown value columns are too varied to enumerate by name (they range from
+    'pct_inhibition' to a bare dose-labelled average like '10nM_AVG'), so we accept
+    EITHER an explicit knockdown-named column OR a dose-labelled average/value
+    column — while ignoring IC50/EC50 and viability columns, which are separate
+    measurements with their own output tables. This is the test that stops a
+    sequence/IC50-only table (no knockdown column) from being read as a knockdown
+    screen and having a fake inhibition % invented from its IC50."""
+    for h in headers:
+        if _IC50_COL_RE.search(h) or _VIABILITY_TITLE_RE.search(h):
+            continue
+        if _KNOCKDOWN_NAMED_RE.search(h) or _AVG_VALUE_RE.search(h):
+            return True
+    return False
+
+
+def _has_explicit_knockdown_column(headers: list[str]) -> bool:
+    """True if a column is EXPLICITLY named as a knockdown/inhibition readout
+    (inhibition, knockdown, silencing, % remaining…), as opposed to a bare
+    dose-labelled average that IC50 and viability tables also carry. Used to flag a
+    table routed to IC50/viability that may actually hold un-extracted knockdown
+    data — a stricter signal than _has_knockdown_data to keep that flag precise."""
+    return any(_KNOCKDOWN_NAMED_RE.search(h) for h in headers
+               if not (_IC50_COL_RE.search(h) or _VIABILITY_TITLE_RE.search(h)))
+
+
+def _resolve_base_type(headers: list[str], context_text: str) -> str:
+    """Pick the BASE table type for the main extraction.
+
+    The title/NOTE classifier is the prior; the COLUMNS overrule it only when they
+    clearly disagree, which is deliberately conservative (when unsure we keep the
+    title's answer, preserving previous behaviour):
+      • a 'primary' default with NO knockdown column but an IC50 (or viability)
+        column → 'ic50' (or 'viability');
+      • an 'ic50'/'viability' title with NO matching column but a real knockdown
+        column → 'primary'.
+    Mixed tables (knockdown AND IC50, etc.) keep this base type and have the other
+    measurement(s) extracted as well by the multi-routing step in the caller."""
+    t = _classify_table(context_text)
+    has_ic50 = _has_ic50_column(headers)
+    has_viab = _has_viability_column(headers)
+    has_kd   = _has_knockdown_data(headers)
+    if t == "primary" and not has_kd:
+        if has_ic50:
+            return "ic50"
+        if has_viab:
+            return "viability"
+    elif t == "ic50" and not has_ic50 and has_kd:
+        return "primary"
+    elif t == "viability" and not has_viab and has_kd:
+        return "primary"
+    return t
+
+
+# ---------------------------------------------------------------------------
+# LLM table-type classifier  (type/types only — never reads data values)
+# ---------------------------------------------------------------------------
+#
+# A patent table is routed by WHICH measurement(s) it reports. The regex
+# detectors above are a solid fallback but misread two recurring cases:
+#   • a cell-VIABILITY table whose values sit in dose-named columns
+#     ("1nM", "0.1nM") — the dose names trip the knockdown test and the table
+#     is demoted to a knockdown screen (→ empty viability output);
+#   • genuinely MIXED tables (e.g. a dose-response screen reporting BOTH
+#     % knockdown AND an IC50) where a single base type loses one measurement.
+#
+# The LLM decides the measurement TYPE(S) from the title, the surrounding
+# NOTE/context lines and the column NAMES only. It never sees or transcribes a
+# data value, so the no-fabrication guarantee is unchanged: extraction stays
+# fully deterministic (DuckDB SQL); the LLM only chooses which extractor(s) run.
+_MEASUREMENT_LABELS = ("knockdown", "ic50", "viability")
+
+
+def _base_from_types(types: set[str]) -> str:
+    """Map a measurement-type set to the routing key the main loop branches on.
+
+    Priority knockdown > ic50 > viability picks the PRIMARY extractor; any other
+    measurement present is added by the multi-routing step. An empty set
+    (sequence / other table) maps to 'primary' so the table still flows through
+    the primary branch and its strand/sequence detectors — it is simply never
+    forced into the knockdown extractor (no fabricated activity, no false
+    0-row failure)."""
+    if "knockdown" in types:
+        return "primary"
+    if "ic50" in types:
+        return "ic50"
+    if "viability" in types:
+        return "viability"
+    return "primary"
+
+
+def _measurement_types_deterministic(headers: list[str], context_text: str) -> set[str]:
+    """Rule-based fallback for the LLM classifier.
+
+    Mirrors the column/title detectors but with the viability-vs-dose fix: a
+    bare dose/avg column counts as knockdown evidence ONLY when there is no
+    viability signal, because a viability screen reports its values in dose
+    columns too. An explicit knockdown-NAMED column always counts."""
+    title_type = _classify_table(context_text)            # primary | ic50 | viability
+    has_ic50 = _has_ic50_column(headers) or title_type == "ic50"
+    has_viab = _has_viability_column(headers) or title_type == "viability"
+    has_kd_named = any(
+        _KNOCKDOWN_NAMED_RE.search(h)
+        for h in headers
+        if not (_IC50_COL_RE.search(h) or _VIABILITY_TITLE_RE.search(h))
+    )
+    has_dose_or_avg = _has_knockdown_data(headers)        # named OR bare dose/avg
+
+    types: set[str] = set()
+    if has_viab:
+        types.add("viability")
+    if has_ic50:
+        types.add("ic50")
+    if has_kd_named:
+        types.add("knockdown")
+    elif has_dose_or_avg and not has_viab:
+        # dose/avg value columns with no viability signal → a knockdown screen
+        types.add("knockdown")
+    return types
+
+
+def _build_table_type_prompt(context_text: str, headers: list[str]) -> str:
+    """Prompt the LLM to label a table's measurement type(s) from its title,
+    NOTE/context lines and column NAMES only (no data values)."""
+    # Keep the context compact: the title and any NOTE/caption lines carry
+    # essentially all the semantic signal; trim the rest to bound tokens.
+    lines = [ln.strip() for ln in context_text.splitlines() if ln.strip()]
+    keep  = [ln for ln in lines
+             if _TABLE_LINE_RE.match(ln) or ln.lower().startswith(("note:", "title:"))]
+    ctx   = ("\n".join(keep) if keep else "\n".join(lines[:8]))[:1500]
+    cols  = ", ".join(h for h in headers if h.strip()) or "(no column names)"
+
+    return f"""\
+You are routing a table extracted from an siRNA/dsRNA patent. Decide WHICH
+quantitative measurement(s) it reports, using ONLY the title, the NOTE/context
+lines and the COLUMN NAMES below. Do NOT infer from or transcribe any data value.
+
+Allowed labels (return a JSON list — may be empty, may contain several):
+  "knockdown"  - target-gene silencing efficacy: % inhibition, % knockdown,
+                 % mRNA/message remaining, relative/normalised expression, or a
+                 single-dose / dose-response in-vitro SCREEN whose value columns
+                 are doses (e.g. "1nM", "10nM", "conc_1_nm", "10nM_avg").
+  "ic50"       - a fitted potency value: IC50 / EC50 / ED50 (nM or pM). The
+                 column name contains ic50/ec50/ed50.
+  "viability"  - cell viability / cytotoxicity: CellTiter, % viable, cell
+                 survival/death, normalised viability. The TITLE or NOTE says
+                 "viability"/"cytotoxicity" even when the value columns are
+                 named as doses (days x concentrations).
+
+Return [] (empty) for tables that are none of the above, e.g. sequence
+listings (sense/antisense/target sequences, SEQ ID NO, modified strands),
+duplex-name/sample-name maps, abbreviation legends, immunostimulatory/cytokine
+activity, or position tables.
+
+Rules
+- A table may report MORE THAN ONE measurement (e.g. a screen with both
+  % knockdown columns AND an IC50 column -> ["knockdown","ic50"]). List all.
+- VIABILITY is decided by the title/NOTE, NOT by the value columns: dose-named
+  columns under a "cell viability" title are still "viability", never
+  "knockdown".
+- When the title is explicit it outranks an ambiguous column name.
+
+Output ONLY a JSON object, no prose:
+  {{"types": ["..."], "reason": "<short>"}}
+
+## TITLE / NOTES / CONTEXT
+{ctx}
+
+## COLUMN NAMES
+{cols}
+"""
+
+
+def _llm_classify_types(context_text: str, headers: list[str],
+                        trace_file: str = "") -> set[str] | None:
+    """Ask the LLM for the table's measurement type set. Returns a validated
+    subset of _MEASUREMENT_LABELS (possibly empty), or None when the LLM is
+    unavailable / unparseable / returns something unusable (→ caller falls back
+    to the deterministic detectors)."""
+    if not _CLIENTS:
+        return None
+    raw = _llm_chat(_build_table_type_prompt(context_text, headers), max_tokens=200)
+    log_trace(trace_file, "LLM-TABLE-TYPE RAW", raw)
+    obj = _parse_json_object(raw)
+    if not isinstance(obj, dict) or not isinstance(obj.get("types"), list):
+        return None
+    _SYN = {"primary": "knockdown", "silencing": "knockdown", "inhibition": "knockdown",
+            "ec50": "ic50", "ed50": "ic50", "potency": "ic50",
+            "cytotoxicity": "viability", "viable": "viability"}
+    types = {_SYN.get(str(t).strip().lower(), str(t).strip().lower()) for t in obj["types"]}
+    return {t for t in types if t in _MEASUREMENT_LABELS}   # may be empty (other table)
+
+
+def _classify_measurements(headers: list[str], context_text: str,
+                           trace_file: str = "") -> dict:
+    """Decide a table's measurement type(s) and routing base.
+
+    LLM-first (type/types only — never reads data values); deterministic
+    detectors as fallback. Returns
+        {"types": set[str], "base": str, "source": "llm"|"fallback"}
+    with types ⊆ {knockdown, ic50, viability} and base ∈ {primary, ic50, viability}."""
+    types  = _llm_classify_types(context_text, headers, trace_file)
+    source = "llm"
+    if types is None:
+        types  = _measurement_types_deterministic(headers, context_text)
+        source = "fallback"
+    return {"types": types, "base": _base_from_types(types), "source": source}
 
 
 # Markers used to recognise a table that was SKIPPED for lack of a recognised
@@ -733,6 +1240,255 @@ def _detect_strand_table(headers: list[str], rows: list[list[str]]
 
     oligo_col = headers[oligo_idx] if oligo_idx is not None else None
     return headers[dup_idx], headers[strand_idx], headers[seq_idx], oligo_col
+
+
+def _detect_oligo_strand_table(headers: list[str], rows: list[list[str]]
+                               ) -> tuple[str, str, str] | None:
+    """Detect a strand-per-row SEQUENCE table keyed by OLIGO ID with NO duplex
+    column. Returns (strand_col, oligo_col, sequence_col) or None.
+
+    Layout (the EPO 'Modified Strand Sequences' listing, e.g. headed
+    Strand | Oligo # | Position | Sequence | SEQ ID NO): one single strand per
+    row, identified by an oligo ID, with a strand marker (s/as) and a sequence,
+    and the duplex membership stated only in a separate table. The duplex-based
+    strand detectors above all require a duplex_id column to pair sense with
+    antisense, so this table slips past them and would otherwise reach the LLM,
+    which does not reliably pivot it. Detecting it here lets the oligo IDs that
+    activity rows pick up from an oligo-map resolve to their sequences during the
+    merge (via the oligo-ID sequence repos).
+
+    Deliberately fires only when there is NO duplex column — a table that has one
+    is handled by _detect_strand_table, which can also pair the strands.
+    """
+    if any(_DUPLEX_COL_RE.search(h) for h in headers):
+        return None
+
+    strand_idx = None
+    for i in range(len(headers)):
+        vals = [row[i].strip().lower().replace(" ", "")
+                for row in rows if i < len(row) and row[i].strip()]
+        if vals and sum(1 for v in vals if v in _STRAND_VALUES) / len(vals) >= 0.6:
+            strand_idx = i
+            break
+    if strand_idx is None:
+        return None
+
+    seq_cols = []
+    for i in range(len(headers)):
+        if i == strand_idx:
+            continue
+        vals = [row[i] for row in rows if i < len(row) and str(row[i]).strip()]
+        if vals and sum(1 for v in vals if _looks_like_sequence(v)) / len(vals) >= 0.6:
+            seq_cols.append(i)
+    if not seq_cols:
+        return None
+
+    def _mod_score(i: int) -> int:
+        vals = [row[i] for row in rows if i < len(row) and str(row[i]).strip()]
+        return sum(1 for v in vals if _is_modified_sequence(str(v).strip()))
+    seq_idx = max(seq_cols, key=_mod_score)
+
+    oligo_idx = None
+    for i in range(len(headers)):
+        if i in (strand_idx, seq_idx):
+            continue
+        vals = [str(row[i]).strip() for row in rows
+                if i < len(row) and str(row[i]).strip()]
+        if vals and sum(1 for v in vals if _OLIGOISH_RE.match(v)) / len(vals) >= 0.6:
+            oligo_idx = i
+            break
+    if oligo_idx is None:
+        return None
+
+    return headers[strand_idx], headers[oligo_idx], headers[seq_idx]
+
+
+# ---------------------------------------------------------------------------
+# LLM-as-column-identifier fallback for sequence tables
+#
+# When a table clearly holds sequences but none of the deterministic detectors
+# above could map it (unusual strand vocabulary like guide/passenger, or odd
+# headers), we ask the LLM ONLY to label the columns — never to transcribe a
+# sequence. A verifier checks the labels against the real values, and then the
+# same kind of deterministic SQL as the detectors copies the exact bytes. This
+# keeps the LLM's flexibility on the brittle part (which column is which) while
+# the nucleotide strings are still copied verbatim, never written by the model.
+# ---------------------------------------------------------------------------
+
+def _has_sequence_column(headers: list[str], rows: list[list[str]]) -> bool:
+    """True if any column's values are predominantly nucleotide sequences."""
+    for i in range(len(headers)):
+        vals = [row[i] for row in rows if i < len(row) and str(row[i]).strip()]
+        if vals and sum(1 for v in vals if _looks_like_sequence(v)) / len(vals) >= 0.6:
+            return True
+    return False
+
+
+def _build_seq_colmap_prompt(headers: list[str], rows: list[list[str]]) -> str:
+    """Prompt asking the LLM to LABEL the columns of a strand/sequence table.
+    It must return only column names and short strand-marker values — never a
+    nucleotide sequence."""
+    sample = "\n".join(" | ".join(str(c) for c in r) for r in rows[:8])
+    cols   = ", ".join(f'"{h}"' for h in headers)
+    return f"""You are labelling the COLUMNS of one table taken from a patent. The table
+lists siRNA / oligonucleotide STRANDS and their sequences. Your job is only to
+say which column is which — you must NOT copy or rewrite any sequence.
+
+RULES:
+- Output ONLY one JSON object. No prose, no markdown fences.
+- Use column names EXACTLY as given below. Use null when a column is absent.
+- NEVER output a nucleotide sequence. You output only column names and the
+  short strand-marker values (e.g. "s", "as", "guide", "passenger").
+- If the table contains assay MEASUREMENTS (inhibition %, IC50, viability, dose
+  response) rather than being purely a strand/sequence listing, set
+  "is_sequence_table" to false and leave the other fields null.
+
+Columns: {cols}
+
+First rows (cells separated by " | "):
+{sample}
+
+Return exactly this JSON shape:
+{{"is_sequence_table": true_or_false,
+ "duplex_col": column_name_or_null,
+ "strand_col": column_name_or_null,
+ "sense_values": [strand_values_meaning_the_SENSE_strand],
+ "antisense_values": [strand_values_meaning_the_ANTISENSE_strand],
+ "oligo_col": column_name_or_null,
+ "sequence_col": column_name_or_null}}
+
+Biology notes for the strand mapping:
+- The GUIDE strand IS the antisense strand; the PASSENGER strand IS the sense
+  strand. Map guide -> antisense_values, passenger -> sense_values.
+- Typical markers: s / sense / passenger -> sense_values;
+  as / a / antisense / guide -> antisense_values."""
+
+
+def _parse_json_object(raw: str | None) -> dict | None:
+    """Extract the first JSON object from an LLM reply, tolerating code fences."""
+    if not raw:
+        return None
+    s = re.sub(r"^```(?:json)?|```$", "", raw.strip(), flags=re.MULTILINE).strip()
+    a, b = s.find("{"), s.rfind("}")
+    if a == -1 or b == -1 or b < a:
+        return None
+    try:
+        out = json.loads(s[a:b + 1])
+        return out if isinstance(out, dict) else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _llm_chat(prompt: str, max_tokens: int = 512) -> str:
+    """One chat completion via the shared Groq key pool, with the same
+    rate-limit handling as the main SQL path. Returns raw text, or '' on
+    repeated failure."""
+    max_attempts = max(6, len(_CLIENTS) * 2)
+    for _ in range(max_attempts):
+        idx = _next_available_idx()
+        if idx is None:
+            time.sleep(_shortest_wait())
+            idx = _next_available_idx() or 0
+        _ACTIVE_IDX[0] = idx
+        try:
+            resp = _active_client().chat.completions.create(
+                model=_GROQ_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0, max_tokens=max_tokens)
+            return resp.choices[0].message.content.strip()
+        except Exception as e:                       # noqa: BLE001
+            err = str(e)
+            if "429" in err or "rate_limit" in err.lower():
+                _record_rate_limit(_active_key(), _parse_retry_after(err))
+    return ""
+
+
+def _llm_identify_sequence_columns(headers: list[str], rows: list[list[str]],
+                                   trace_file: str) -> dict | None:
+    """Ask the LLM to label the columns of a strand/sequence table. Returns the
+    parsed mapping dict, or None."""
+    raw = _llm_chat(_build_seq_colmap_prompt(headers, rows))
+    log_trace(trace_file, "LLM-COLMAP RAW", raw)
+    return _parse_json_object(raw)
+
+
+def _verify_sequence_mapping(m: dict | None, headers: list[str],
+                             rows: list[list[str]]) -> bool:
+    """Sanity-check an LLM column mapping against the real values before trusting
+    it. Guards against the LLM mislabelling a column or grabbing an assay table.
+    Requires a strand column (this fallback handles strand-per-row tables) and at
+    least one ID column (oligo or duplex) to join on."""
+    if not m or not m.get("is_sequence_table"):
+        return False
+    hset = set(headers)
+
+    def col_vals(name):
+        i = headers.index(name)
+        return [row[i] for row in rows if i < len(row) and str(row[i]).strip()]
+
+    seq_col = m.get("sequence_col")
+    if seq_col not in hset:
+        return False
+    sv = col_vals(seq_col)
+    if not sv or sum(1 for v in sv if _looks_like_sequence(v)) / len(sv) < 0.6:
+        return False                                  # named column isn't sequences
+
+    strand_col = m.get("strand_col")
+    if strand_col not in hset:
+        return False
+    declared = {str(x).strip().lower()
+                for x in (m.get("sense_values") or []) + (m.get("antisense_values") or [])}
+    stv = [str(v).strip().lower() for v in col_vals(strand_col)]
+    if not declared or not stv or sum(1 for v in stv if v in declared) / len(stv) < 0.6:
+        return False                                  # strand values don't match the data
+
+    for key in ("oligo_col", "duplex_col"):
+        if m.get(key) is not None and m[key] not in hset:
+            return False
+    if m.get("oligo_col") is None and m.get("duplex_col") is None:
+        return False                                  # nothing to join the sequence onto
+    return True
+
+
+def _build_sequence_sql_from_mapping(m: dict) -> str:
+    """Build the deterministic strand-per-row pivot SQL from a verified mapping.
+    Routes each row's oligo ID and sequence to the correct strand field by the
+    LLM-identified strand values; the sequence is copied verbatim from the cell.
+    """
+    seq_c, strand_c = m["sequence_col"], m["strand_col"]
+    oligo_c, dup_c  = m.get("oligo_col"), m.get("duplex_col")
+
+    def _in_list(vals):
+        cleaned = sorted({str(v).strip().lower() for v in vals if str(v).strip()})
+        if not cleaned:
+            return "('\\x00')"                        # matches nothing
+        return "(" + ", ".join("'" + v.replace("'", "''") + "'" for v in cleaned) + ")"
+
+    sense_in = _in_list(m.get("sense_values") or [])
+    anti_in  = _in_list(m.get("antisense_values") or [])
+    norm     = f'lower(trim(CAST("{strand_c}" AS VARCHAR)))'
+    dup_sql  = f'"{dup_c}"' if dup_c else "NULL"
+    s_oligo  = f'CASE WHEN {norm} IN {sense_in} THEN "{oligo_c}" END' if oligo_c else "NULL"
+    a_oligo  = f'CASE WHEN {norm} IN {anti_in}  THEN "{oligo_c}" END' if oligo_c else "NULL"
+    return f"""
+SELECT
+    {dup_sql} AS duplex_id,
+    CASE WHEN {norm} IN {sense_in} THEN "{seq_c}" END AS sense_sequence,
+    CASE WHEN {norm} IN {anti_in}  THEN "{seq_c}" END AS antisense_sequence,
+    {s_oligo} AS sense_oligo_id,
+    {a_oligo} AS antisense_oligo_id,
+    NULL AS cell_line,
+    NULL AS dose_nM,
+    NULL AS inhibition_percent,
+    NULL AS value_sd,
+    NULL AS replicate,
+    NULL AS transfection_method,
+    NULL AS target_gene_name,
+    NULL AS patent_id,
+    NULL AS source_file
+FROM secondary_table
+WHERE "{seq_c}" IS NOT NULL
+""".strip()
 
 
 def _detect_implicit_strand_table(headers: list[str], rows: list[list[str]]
@@ -1101,6 +1857,16 @@ EXTRACTION RULES:
 3. duplex_id: map the Duplex/compound ID column. Output EXACTLY as it appears.
    If no duplex_id-like column exists output __SKIP__.
 4. inhibition_percent (a PERCENT on a 0-100 scale):
+   - *** NEVER derive inhibition_percent from a CONCENTRATION/POTENCY column —
+     IC50, IC 50, EC50, CC50, GI50, KD, Ki, or any column carrying a dose in
+     nM/µM/pM. A concentration is NOT a percentage; there is NO formula that
+     converts an IC50 into a knockdown %. Do NOT write things like
+     (100 - ic50) * 100 or 100 - ic50. ***
+   - *** If the table's ONLY measurement is an IC50/EC50/concentration (i.e.
+     there is NO inhibition %, knockdown %, "% remaining", or relative-to-control
+     column), then inhibition_percent MUST be NULL for every row. The IC50 is
+     captured by a separate IC50 extraction — never fabricate a knockdown % from
+     it. ***
    - Direct knockdown/inhibition % column → use directly.
    - "remaining" column (message/mRNA/transcript remaining, or relative to a
      control) → CONVERT to inhibition. CHOOSE THE SCALE by looking at the DATA
@@ -1352,9 +2118,15 @@ SELECT duplex_id, 'a549', NULL, NULL, TRY_CAST(a549 AS DOUBLE)/1e3, 'pM',
 
 def _build_viability_prompt(csv_headers: list[str], context_text: str,
                               csv_preview: str) -> str:
-    fields_str  = ",\n  ".join([f"NULL AS {f}" for f in VIABILITY_FIELDS])
+    # Columns the SQL must emit. viability_basis / viability_relative_to /
+    # transfection_method are assay properties stamped on the rows afterwards
+    # (the LLM never produces them), so they are excluded from the prompt.
+    _sql_fields = [f for f in VIABILITY_FIELDS
+                   if f not in ("viability_basis", "viability_relative_to",
+                                "transfection_method")]
+    fields_str  = ",\n  ".join([f"NULL AS {f}" for f in _sql_fields])
     headers_str = ", ".join(csv_headers)
-    n_fields    = len(VIABILITY_FIELDS)
+    n_fields    = len(_sql_fields)
 
     return f"""\
 You are an expert data engineer working with siRNA patent data.
@@ -1387,38 +2159,63 @@ EXTRACTION RULES:
 1. Always query from `secondary_table`.
 2. Output EXACTLY these {n_fields} columns in this order.
 3. duplex_id: the Duplex/compound ID column. If absent output __SKIP__.
-4. cell_line: hardcode from context NOTEs (e.g. 'HeLa', 'Hep3B'). NULL if unknown.
-5. day: assay day as integer (e.g. 3, 6). Derive from context NOTEs. NULL if not stated.
-6. dose_nM: siRNA dose in nM. Extract from column name (e.g. avg_10_nM → 10.0,
-   avg_500_pM → 0.5, avg_100_pM → 0.1, avg_50_pM → 0.05).
-   UNPIVOT wide-format tables using UNION ALL — one SELECT per dose column.
-   Pair each avg column with its matching stdev column on the same row.
-7. viability_percent: the % viable value. ALWAYS TRY_CAST(col AS DOUBLE).
+4. cell_line:
+   - If a COLUMN holds the cell line (repeated cell-line names such as
+     'OMM-1.3', 'MEL202', 'MEL-285', 'HeLa', 'A549'), SELECT that column AS
+     cell_line. It varies per row, so DO NOT hardcode it and DO NOT filter rows
+     by it — every cell line is then captured automatically.
+   - Otherwise, if the context states a single cell line, hardcode it.
+   - NULL if unknown.
+5. day: assay day as integer (e.g. 3, 5, 7).
+   - If the value-column NAME encodes the day (e.g. day_3_1nm → 3,
+     day_7_0_001nm → 7), parse it from the name.
+   - Otherwise derive from the context NOTEs. NULL if not stated.
+6. dose_nM: siRNA dose in nM, parsed from the value-column NAME:
+   avg_10_nM → 10.0, avg_500_pM → 0.5, avg_100_pM → 0.1, avg_50_pM → 0.05,
+   day_3_1nm → 1.0, day_5_0_01nm → 0.01, day_7_0_001nm → 0.001.
+   UNPIVOT wide tables with UNION ALL — ONE SELECT per value column.
+   Pair each value column with its matching stdev/sd column WHEN one exists
+   (a viability matrix may have no SD columns — then viability_sd is NULL).
+7. viability_value: the viability value, stored EXACTLY as reported (a percent
+   or a normalised ratio — do NOT rescale it). ALWAYS TRY_CAST(col AS DOUBLE).
 8. viability_sd: matching SD column. TRY_CAST(col AS DOUBLE). NULL if absent.
 9. target_gene_name: infer from context or a 'target' column. NULL if unknown.
 10. patent_id: always NULL.
 11. source_file: always NULL.
-12. transfection_method: always NULL (filled later from the context text).
+12. transfection_method: do NOT output it (filled later from the context text).
 13. Return ONLY valid SQL. No markdown, no explanation.
 14. ARITHMETIC TYPE SAFETY: always TRY_CAST arithmetic columns to DOUBLE.
-14. The table may contain MULTIPLE GROUPS of rows for different cell lines / days,
-    separated by blank rows. Context NOTEs label each group in order
-    (e.g. "HeLa day 3", "HeLa day 6", "Hep3B day 3", "Hep3B day 6").
-    The rows are stored sequentially in one CSV; you cannot filter by row number.
-    Instead produce a UNION ALL that emits one SELECT per (cell_line × day × dose)
-    combination using the full table. The merge step will deduplicate correctly.
-    Hardcode each cell_line and day from the ordered NOTE labels in the context.
+15. Wide layouts come in two shapes — use whichever matches the columns:
+    (a) cell_line is a COLUMN and day & dose are encoded in the value-column
+        NAMES (e.g. day_3_1nm … day_7_0_001nm). Emit one SELECT per value
+        column, carrying duplex_id and the cell_line column, and parse day and
+        dose from each column name. (EXAMPLE A.)
+    (b) the table stacks groups of rows for different cell_line/day, labelled
+        in order by the context NOTEs, with dose columns shared across groups.
+        Emit one SELECT per (cell_line × day × dose), hardcoding cell_line and
+        day from the NOTE labels. (EXAMPLE B.)
 
-EXAMPLE — wide viability table, 4 cell_line/day groups, 5 dose columns:
+EXAMPLE A — cell_line is a column; day & dose live in the value-column names:
+  Columns: cell_line | duplex_id | day_3_1nm | day_3_0_1nm | ... | day_7_0_001nm
+SELECT duplex_id AS duplex_id, cell_line AS cell_line, 3 AS day, 1.0 AS dose_nM,
+  TRY_CAST(day_3_1nm AS DOUBLE) AS viability_value,
+  NULL AS viability_sd,
+  NULL AS target_gene_name, NULL AS patent_id, NULL AS source_file
+FROM secondary_table WHERE duplex_id IS NOT NULL
+UNION ALL
+SELECT duplex_id, cell_line, 3, 0.1,
+  TRY_CAST(day_3_0_1nm AS DOUBLE), NULL, NULL, NULL, NULL
+FROM secondary_table WHERE duplex_id IS NOT NULL
+-- ... continue for EVERY day_x_ynm value column (all 12 here) ...
+;
+
+EXAMPLE B — stacked cell_line/day groups labelled by NOTEs; shared dose columns:
   Columns: target | duplex_id | avg_10_nM | avg_1_nM | avg_500_pM |
            avg_100_pM | avg_50_pM | stdev_10_nM | stdev_1_nM |
            stdev_500_pM | stdev_100_pM | stdev_50_pM
   Context NOTEs (in order): HeLa day 3 / HeLa day 6 / Hep3B day 3 / Hep3B day 6
-
--- (repeat the pattern below for every cell_line × day × dose combination)
-SELECT duplex_id AS duplex_id, 'HeLa' AS cell_line, 3 AS day,
-  10.0 AS dose_nM,
-  TRY_CAST(avg_10_nM AS DOUBLE) AS viability_percent,
+SELECT duplex_id AS duplex_id, 'HeLa' AS cell_line, 3 AS day, 10.0 AS dose_nM,
+  TRY_CAST(avg_10_nM AS DOUBLE) AS viability_value,
   TRY_CAST(stdev_10_nM AS DOUBLE) AS viability_sd,
   target AS target_gene_name, NULL AS patent_id, NULL AS source_file
 FROM secondary_table WHERE duplex_id IS NOT NULL
@@ -1448,10 +2245,17 @@ def _extract_sql(raw: str) -> str:
 # ---------------------------------------------------------------------------
 
 def generate_sql_query(csv_path: str, context_text: str, trace_file: str,
-                        table_type: str = "primary") -> str:
+                        table_type: str = "primary",
+                        knockdown_expected: bool = True) -> str:
     """
     Return a DuckDB SQL SELECT for this CSV.
     table_type: 'primary' | 'ic50' | 'viability'
+    knockdown_expected: whether the classifier found a 'knockdown' measurement.
+        When False on a 'primary' table, the knockdown extractor is NOT run —
+        the table may still yield sequence rows via the detectors, but it is
+        never forced through the % inhibition formula (which would fabricate
+        knockdown from non-knockdown columns, e.g. an immunostimulation table's
+        % IFN-alpha / % TNF-alpha).
     Returns '__SKIP__' when the table should be skipped entirely.
     """
     if not _CLIENTS:
@@ -1495,32 +2299,16 @@ def generate_sql_query(csv_path: str, context_text: str, trace_file: str,
                   "Duplex-pair ID cross-reference table — no activity data.")
         return "__SKIP__"
 
-    # For primary tables: detect and handle oligo-map tables without LLM
-    if table_type == "primary":
-        duplex_col, sense_col, antisense_col = _detect_oligo_map(csv_headers)
-        if duplex_col and sense_col and antisense_col:
-            log_trace(trace_file, "TABLE TYPE",
-                      f"Oligo-map detected — skipping LLM: "
-                      f"duplex={duplex_col}, sense={sense_col}, antisense={antisense_col}")
-            sql = f"""
-SELECT
-    "{duplex_col}"    AS duplex_id,
-    NULL              AS sense_sequence,
-    NULL              AS antisense_sequence,
-    "{sense_col}"     AS sense_oligo_id,
-    "{antisense_col}" AS antisense_oligo_id,
-    NULL AS cell_line,
-    NULL AS dose_nM,
-    NULL AS inhibition_percent,
-    NULL AS value_sd,
-    NULL AS target_gene_name,
-    NULL AS patent_id,
-    NULL AS source_file
-FROM secondary_table
-WHERE "{duplex_col}" IS NOT NULL
-""".strip()
-            log_trace(trace_file, "OLIGO-MAP SQL", sql)
-            return sql
+    # Oligo-map tables (duplex_id + sense/antisense oligo IDs, no sequences) are
+    # intentionally NOT fast-tracked. A deterministic bypass here would emit SQL
+    # hardcoding target_gene_name = NULL, discarding any gene the patent states
+    # only in this table's surrounding context — which is then lost for good,
+    # because oligo-map rows receive no other gene enrichment in the merge. They
+    # therefore fall through to the LLM path below (_build_primary_prompt): it
+    # reads the context and can populate target_gene_name, while assay columns it
+    # cannot find stay NULL exactly as the prompt instructs. The row is still an
+    # oligo-map (oligo IDs, no sequences, no assay values) for the merge, but it
+    # now carries the gene.
 
     # For primary tables: detect strand-per-row sequence tables and PIVOT them
     # deterministically (sense on one row + antisense on another → one row with
@@ -1666,6 +2454,95 @@ WHERE "{dup_c}" IS NOT NULL
             log_trace(trace_file, "WIDE-2SEQ SQL", sql)
             return sql
 
+    # For primary tables: a strand-per-row SEQUENCE table keyed by OLIGO ID with
+    # NO duplex column (the 'Modified Strand Sequences' listing). None of the
+    # duplex-based detectors above can pair its strands, and the LLM does not
+    # pivot it reliably, so emit one seq-only row per strand — routing the oligo
+    # ID and its sequence to the correct strand field by the strand marker. The
+    # merge then resolves these by oligo ID onto activity rows that carry the
+    # oligo IDs (e.g. from an oligo-map), filling sense_/antisense_sequence.
+    if table_type == "primary":
+        preview_rows = [ln.split(delim) for ln in csv_lines[1:16] if ln.strip()]
+        ostr_hit = _detect_oligo_strand_table(csv_headers, preview_rows)
+        if ostr_hit:
+            strand_c, oligo_c, seq_c = ostr_hit
+            norm       = f"lower(trim(CAST(\"{strand_c}\" AS VARCHAR)))"
+            sense_when = "('s','sense','sensestrand','sense strand')"
+            anti_when  = "('a','as','antisense','antisensestrand','antisense strand')"
+            log_trace(trace_file, "OLIGO-STRAND-SEQ",
+                      f"strand={strand_c}, oligo={oligo_c}, sequence={seq_c}")
+            sql = f"""
+SELECT
+    NULL AS duplex_id,
+    CASE WHEN {norm} IN {sense_when} THEN "{seq_c}"   END AS sense_sequence,
+    CASE WHEN {norm} IN {anti_when}  THEN "{seq_c}"   END AS antisense_sequence,
+    CASE WHEN {norm} IN {sense_when} THEN "{oligo_c}" END AS sense_oligo_id,
+    CASE WHEN {norm} IN {anti_when}  THEN "{oligo_c}" END AS antisense_oligo_id,
+    NULL AS cell_line,
+    NULL AS dose_nM,
+    NULL AS inhibition_percent,
+    NULL AS value_sd,
+    NULL AS replicate,
+    NULL AS transfection_method,
+    NULL AS target_gene_name,
+    NULL AS patent_id,
+    NULL AS source_file
+FROM secondary_table
+WHERE "{oligo_c}" IS NOT NULL AND "{seq_c}" IS NOT NULL
+""".strip()
+            log_trace(trace_file, "OLIGO-STRAND-SEQ SQL", sql)
+            return sql
+
+    # For primary tables: a sequence-looking column is present but none of the
+    # deterministic detectors above could map the table (unusual strand vocabulary
+    # such as guide/passenger, or odd headers). Ask the LLM ONLY to label the
+    # columns — never to transcribe a sequence — verify the labels against the
+    # real values, then copy the exact bytes with deterministic SQL. The mapped
+    # SQL is cached so a re-run does not re-hit the API.
+    if table_type == "primary":
+        preview_rows = [ln.split(delim) for ln in csv_lines[1:16] if ln.strip()]
+        if _has_sequence_column(csv_headers, preview_rows):
+            colmap_cache = ""
+            if _CACHE_DIR[0]:
+                os.makedirs(_CACHE_DIR[0], exist_ok=True)
+                colmap_cache = os.path.join(
+                    _CACHE_DIR[0], f"{_sql_cache_key(csv_path, 'colmap', '')}.sql")
+                if os.path.exists(colmap_cache):
+                    try:
+                        cached = open(colmap_cache, encoding="utf-8").read().strip()
+                    except OSError:
+                        cached = ""
+                    if cached:
+                        log_trace(trace_file, "LLM-COLMAP CACHE HIT", colmap_cache)
+                        print("  (cached column-map SQL reused — no API call)")
+                        return cached
+            mapping = _llm_identify_sequence_columns(csv_headers, preview_rows, trace_file)
+            if _verify_sequence_mapping(mapping, csv_headers, preview_rows):
+                sql = _build_sequence_sql_from_mapping(mapping)
+                log_trace(trace_file, "LLM-COLMAP SEQ SQL", sql)
+                if colmap_cache:
+                    try:
+                        with open(colmap_cache, "w", encoding="utf-8") as f:
+                            f.write(sql)
+                    except OSError:
+                        pass
+                return sql
+            log_trace(trace_file, "LLM-COLMAP",
+                      "no usable sequence mapping — falling back to the standard prompt")
+
+    # An empty-measurement table (e.g. immunostimulatory / cytokine activity,
+    # off-target panels) can reach the primary branch with a duplex_id column and
+    # dose-like values. It is allowed to yield SEQUENCE rows via the detectors
+    # above, but if none fired it must NOT be run through the knockdown extractor:
+    # forcing its non-knockdown columns (e.g. % IFN-alpha, % TNF-alpha) through the
+    # "(1 - value) * 100" formula fabricates inhibition (0 % induction -> 100 %
+    # "knockdown"). Skip it instead.
+    if table_type == "primary" and not knockdown_expected:
+        log_trace(trace_file, "TABLE SKIPPED",
+                  "no knockdown measurement and not a sequence table — table not "
+                  "run through the knockdown extractor")
+        return "__SKIP__"
+
     # Build the right prompt
     if table_type == "ic50":
         prompt = _build_ic50_prompt(csv_headers, context_text, csv_preview)
@@ -1768,10 +2645,165 @@ def _run_sql_on_csv(sql_query: str, csv_path: str, all_varchar: bool):
         return con.execute(sql_query).df()
 
 
+# ---------------------------------------------------------------------------
+# Guard: the LLM must never put a fabricated VALUE in a measurement column
+# ---------------------------------------------------------------------------
+#
+# The pipeline's core invariant is that the measured quantities — inhibition %,
+# IC50, viability, and the sequences — are always READ FROM A CSV COLUMN by the
+# generated SQL, never typed as a literal by the model. Execution is
+# deterministic (DuckDB on the CSV), so a column reference is faithful; a numeric
+# literal in a value position would be a value the model invented. The assay
+# COORDINATES (day, dose) are exempt — those are legitimately literals parsed
+# from a column name or the context. This guard parses the generated SQL and
+# refuses to emit rows when a measurement column is assigned a non-NULL constant,
+# turning "the LLM doesn't touch the data" from a convention into an invariant.
+
+_COORDINATE_VALUE_FIELDS = {"day", "dose_nM", "timepoint_hrs"}
+_SEQUENCE_VALUE_FIELDS   = {"sense_sequence", "antisense_sequence",
+                            "sense_sequence_unmodified",
+                            "antisense_sequence_unmodified"}
+# Tokens inside a value expression that are NOT column references (keywords,
+# casts, types, the handful of functions the generated SQL may use). Any other
+# bareword identifier is taken to be a column name.
+_SQL_NONCOL_TOKENS = {
+    "try_cast", "cast", "convert", "as", "null", "coalesce", "nullif", "ifnull",
+    "round", "abs", "floor", "ceil", "case", "when", "then", "else", "end",
+    "double", "float", "real", "decimal", "numeric", "integer", "int", "bigint",
+    "smallint", "varchar", "char", "text", "string", "boolean", "bool",
+    "and", "or", "not", "is", "distinct", "true", "false",
+}
+
+
+def _enforced_value_fields(fields: list[str], numeric_fields: set[str]) -> set[str]:
+    """Output columns whose value MUST come from a CSV column rather than a
+    literal: the measured numerics (numeric fields minus the assay coordinates)
+    plus any sequence columns present in this table's schema."""
+    measured_numeric = set(numeric_fields) - _COORDINATE_VALUE_FIELDS
+    return measured_numeric | (_SEQUENCE_VALUE_FIELDS & set(fields))
+
+
+def _split_top_level(s: str, sep_re: re.Pattern) -> list[str]:
+    """Split *s* on matches of *sep_re* that occur at parenthesis depth 0 and
+    outside single/double quotes."""
+    out, depth, quote, last, i = [], 0, None, 0, 0
+    while i < len(s):
+        c = s[i]
+        if quote:
+            if c == quote:
+                quote = None
+            i += 1
+            continue
+        if c in "'\"":
+            quote = c
+            i += 1
+            continue
+        if c == "(":
+            depth += 1
+            i += 1
+            continue
+        if c == ")":
+            depth -= 1
+            i += 1
+            continue
+        if depth == 0:
+            m = sep_re.match(s, i)
+            if m and m.end() > i:
+                out.append(s[last:i])
+                i = m.end()
+                last = i
+                continue
+        i += 1
+    out.append(s[last:])
+    return out
+
+
+_FROM_RE   = re.compile(r"from\b", re.IGNORECASE)
+_COMMA_RE  = re.compile(r",")
+_AS_RE     = re.compile(r"\s+as\s+", re.IGNORECASE)
+_ALIAS_RE  = re.compile(r'\s*"?([A-Za-z_][A-Za-z0-9_]*)"?')
+
+
+def _aliased_select_items(sql: str) -> list[tuple[str, str]]:
+    """Return (alias, value_expression) for every top-level select item across
+    all SELECTs in *sql*. Paren/quote-aware, so only the OUTER ``AS alias`` is
+    treated as the alias (the inner ``AS DOUBLE`` of a TRY_CAST is ignored)."""
+    s = re.sub(r"--[^\n]*", "", sql)                       # drop line comments
+    items: list[tuple[str, str]] = []
+    for m in re.finditer(r"\bselect\b", s, re.IGNORECASE):
+        select_list = _split_top_level(s[m.end():], _FROM_RE)[0]
+        for raw in _split_top_level(select_list, _COMMA_RE):
+            seg = raw.strip()
+            if not seg:
+                continue
+            as_parts = _split_top_level(seg, _AS_RE)
+            if len(as_parts) < 2:                          # no explicit alias
+                continue
+            am = _ALIAS_RE.match(as_parts[-1])
+            if not am:
+                continue
+            alias = am.group(1)
+            expr  = " AS ".join(as_parts[:-1]).strip()
+            items.append((alias, expr))
+    return items
+
+
+def _expr_has_column_ref(expr: str) -> bool:
+    """True if a value expression references at least one CSV column. Double-
+    quoted identifiers count as columns; single-quoted string literals are
+    removed first; any remaining bareword that is not a SQL keyword/type/function
+    is a column name."""
+    if re.search(r'"[^"]+"', expr):                        # "Quoted Column"
+        return True
+    e = re.sub(r"'(?:[^']|'')*'", " ", expr)               # strip 'literals'
+    return any(tok.lower() not in _SQL_NONCOL_TOKENS
+               for tok in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", e))
+
+
+def _value_is_fabricated(expr: str) -> bool:
+    """True if a measurement value expression is a NON-NULL constant the model
+    typed (a literal number or string) rather than a column reference or NULL."""
+    if _expr_has_column_ref(expr):
+        return False                                       # reads a column → fine
+    core = re.sub(r"\b(?:try_cast|cast)\b", "", expr, flags=re.IGNORECASE)
+    core = core.replace("(", " ").replace(")", " ")
+    core = re.sub(r"\bas\s+\w+", " ", core, flags=re.IGNORECASE)   # drop "AS DOUBLE"
+    core = core.strip().strip(",").strip().upper()
+    return core not in ("", "NULL")                        # non-null constant
+
+
+def _measurement_value_violations(sql: str, fields: list[str],
+                                  numeric_fields: set[str]) -> list[tuple[str, str]]:
+    """List (column, expression) where the SQL assigns a fabricated constant to a
+    measurement/sequence column. Empty list == the invariant holds."""
+    enforced = _enforced_value_fields(fields, numeric_fields)
+    if not enforced:
+        return []
+    seen, out = set(), []
+    for alias, expr in _aliased_select_items(sql):
+        if alias in enforced and _value_is_fabricated(expr):
+            key = (alias, expr)
+            if key not in seen:
+                seen.add(key)
+                out.append(key)
+    return out
+
+
 def _execute_sql(sql_query: str, csv_path: str, source_file: str,
                  trace_file: str, fields: list[str],
                  numeric_fields: set[str]) -> list[dict]:
     """Run the LLM-generated SQL against the CSV and return a list of row dicts."""
+    # INVARIANT GUARD: refuse to emit rows if the SQL assigns a fabricated
+    # constant to a measurement/sequence column. Measured values must be read
+    # from a CSV column (deterministic), never typed by the model.
+    violations = _measurement_value_violations(sql_query, fields, numeric_fields)
+    if violations:
+        detail = "; ".join(f"{col} <- {expr}" for col, expr in violations)
+        log_trace(trace_file, "MEASUREMENT LITERAL BLOCKED",
+                  f"SQL assigns a constant to a measurement column; refusing to "
+                  f"emit fabricated values: {detail}")
+        return []
+
     try:
         try:
             result = _run_sql_on_csv(sql_query, csv_path, all_varchar=False)
@@ -2294,6 +3326,95 @@ def build_primary_table(
         _process_table_group(csv_files, output_path, per_file_dir)
 
 
+# A target_gene_name cell that is really a control / role label, not a gene.
+# The LLM sometimes drops these into the gene column for control wells, e.g.
+# "(+) control", "(-) control", "mock", "non-targeting". They must not be read
+# as genes, nor be overwritten WITH the target gene (a control does not silence
+# it: positive controls hit a different gene, negative controls hit nothing).
+_GENE_CONTROL_RE = re.compile(
+    r'^[\(\[]?\s*[+\-]?\s*[\)\]]?\s*'
+    r'(control|ctrl|mock|pbs|untreated|na[iï]ve|vehicle|buffer|blank|'
+    r'scrambl\w*|non[\s_\-]?targeting|neg(ative)?|pos(itive)?)\b',
+    re.IGNORECASE,
+)
+
+
+def _clean_gene_value(value) -> str | None:
+    """Return a tidy gene symbol, or None when the cell is blank or holds a
+    control/role label instead of a gene.
+
+    Trims stray surrounding whitespace and footnote dots (e.g. 'ANGPTL3 .' ->
+    'ANGPTL3'), and maps control labels ('(+) control', 'mock', ...) to None."""
+    if value is None:
+        return None
+    s = re.sub(r'^[\s.]+|[\s.]+$', '', str(value))     # drop edge spaces/dots
+    s = re.sub(r'\s+', ' ', s)
+    if not s or _GENE_CONTROL_RE.match(s):
+        return None
+    return s
+
+
+def _propagate_patent_gene(*row_lists: list[dict]) -> None:
+    """Normalise the gene column and fill a missing target_gene_name across the
+    three tables of ONE patent.
+
+    Two steps, both mutating the row dicts in place:
+
+    1. CLEAN every gene cell with _clean_gene_value: footnote-marked symbols are
+       repaired ('ANGPTL3 .' -> 'ANGPTL3') and control/role labels ('(+) control',
+       'mock', ...) are blanked, because they are not genes.
+
+    2. FILL the patent's single target gene onto experimental rows that are still
+       blank — closing gaps in the IC50/viability tables (which get no other gene
+       enrichment) and in any primary row the duplex-ID join did not reach.
+
+    A row is treated as a CONTROL — and so is NEVER given the target gene — when
+    its gene cell held a control label or its duplex_id is a known control
+    (AD-1955, mock, PBS, ...). This keeps positive/negative-control wells from
+    being mislabelled with the silenced target. Filling acts only when the
+    experimental rows agree on one gene; otherwise a warning is printed and only
+    the cleaning is applied.
+    """
+    flagged: list[tuple[dict, bool]] = []      # (row, is_control)
+    real_genes: list[str] = []
+
+    for rows in row_lists:
+        for r in rows:
+            raw     = r.get("target_gene_name")
+            cleaned = _clean_gene_value(raw)
+            is_control = (
+                (raw not in (None, "") and cleaned is None)        # was a control label
+                or bool(_CONTROL_ID_RE.search(str(r.get("duplex_id") or "")))
+            )
+            r["target_gene_name"] = cleaned                        # step 1: clean in place
+            flagged.append((r, is_control))
+            if cleaned is not None and not is_control:
+                real_genes.append(cleaned)
+
+    if not real_genes:
+        return
+
+    if len({g.casefold() for g in real_genes}) > 1:
+        print(f"  [gene] multiple target genes present {sorted(set(real_genes))}; "
+              f"cleaned the column but skipping gene fill.")
+        return
+
+    # One agreed gene: pick its most frequent spelling (ties → first seen).
+    counts: dict[str, int] = {}
+    for g in real_genes:
+        counts[g] = counts.get(g, 0) + 1
+    gene = max(counts, key=counts.get)
+
+    filled = 0
+    for r, is_control in flagged:                                  # step 2: fill
+        if not is_control and r.get("target_gene_name") in (None, ""):
+            r["target_gene_name"] = gene
+            filled += 1
+    if filled:
+        print(f"  [gene] propagated '{gene}' to {filled} experimental row(s) "
+              f"across all tables (control rows left blank).")
+
+
 def _process_table_group(
     csv_files:    list[str],
     output_path:  str,
@@ -2323,6 +3444,8 @@ def _process_table_group(
     primary_rows:    list[dict] = []
     ic50_rows:       list[dict] = []
     viability_rows:  list[dict] = []
+    flagged_rows:    list[dict] = []   # quarantined rows (immune / in-vivo disagreement)
+    context_texts:   list[str]  = []   # titles/captions, for patent-level gene resolution
 
     for t_i, csv_file in enumerate(csv_files, start=1):
         base     = os.path.splitext(os.path.basename(csv_file))[0]
@@ -2334,16 +3457,112 @@ def _process_table_group(
         if os.path.exists(ctx_file):
             with open(ctx_file, encoding="utf-8") as _f:
                 context_text = _f.read()
+        context_texts.append(context_text)
 
-        # Classify table type from context metadata lines
-        table_type = _classify_table(context_text)
-        print(f"  Table type: {table_type}")
-        log_trace(file_log, "TABLE TYPE DETECTED", table_type)
+        # Decide the measurement TYPE(S). An LLM reads the title / NOTE lines /
+        # column names (never the data values) and returns the set of
+        # measurements present; the deterministic detectors are the fallback.
+        # The base type drives the primary extractor; any other measurement is
+        # picked up by the multi-routing step below. See _classify_measurements.
+        headers      = _read_csv_headers(csv_file)
+        measurements = _classify_measurements(headers, context_text, file_log)
+        table_type   = measurements["base"]
+        print(f"  Table type: {table_type}  "
+              f"(measurements={sorted(measurements['types']) or 'none'}, "
+              f"via {measurements['source']})")
+        log_trace(file_log, "TABLE TYPE DETECTED",
+                  f"base={table_type} types={sorted(measurements['types'])} "
+                  f"source={measurements['source']}")
+
+        # Deterministic cross-checks, advisory. If the LLM routed this table to
+        # knockdown but its columns look like cytokine/immune readouts or an
+        # in-vivo animal study, the signals disagree. Rather than silently trusting
+        # the LLM (and polluting the in-vitro knockdown table) or silently dropping
+        # the rows (a wrong rule could delete good data), we QUARANTINE the table's
+        # rows: they go to flagged_rows.csv instead of the main tables, and a record
+        # is added to the failed_tables manifest. Nothing is lost — the rows are
+        # kept, just held aside for review — and the main dataset stays clean.
+        flag_reasons: list[str] = []
+        if "knockdown" in measurements["types"] and _looks_like_immune_table(headers):
+            flag_reasons.append("columns look like immune/cytokine readouts "
+                                "(IFN/TNF/IL…), not target knockdown")
+            print("  ⚠ quarantined: knockdown vs immune-readout disagreement")
+            log_trace(file_log, "TYPE DISAGREEMENT",
+                      "LLM=knockdown but deterministic sniff=immune readouts")
+        if "knockdown" in measurements["types"] and _looks_like_invivo_table(headers):
+            flag_reasons.append("columns look like an in-vivo animal study "
+                                "(mg/kg dosing, tissue, or species)")
+            print("  ⚠ quarantined: in-vivo columns in a knockdown table")
+            log_trace(file_log, "INVIVO DISAGREEMENT",
+                      "LLM=knockdown but deterministic sniff=in-vivo study")
+        flag_reason = "; ".join(flag_reasons)
+        if flag_reason:
+            _record_failed(_derive_patent_id(csv_file), os.path.basename(csv_file),
+                           table_type, "quarantined_review",
+                           f"rows quarantined to flagged_rows.csv — {flag_reason}; "
+                           "verify before reinstating into the dataset")
+
+        # Flag A — IC50 / viability data possibly sitting in the KNOCKDOWN table.
+        # Column-based, so it works even when the title has no words: the rows went
+        # to the knockdown extractor, but a column marks IC50/EC50 or viability AND
+        # that measurement was NOT separately extracted. A genuine mixed table (the
+        # other type IS in `types`, handled by multi-routing) is deliberately left
+        # alone, so this fires only on a real un-extracted mismatch. Flagged for
+        # review, NOT quarantined: the knockdown rows may well be correct, so they
+        # are surfaced rather than removed.
+        if table_type == "primary" and "knockdown" in measurements["types"]:
+            mismatch = None
+            if _has_ic50_column(headers) and "ic50" not in measurements["types"]:
+                mismatch = "IC50/EC50"
+            elif _has_viability_column(headers) and "viability" not in measurements["types"]:
+                mismatch = "viability"
+            if mismatch:
+                _record_failed(_derive_patent_id(csv_file), os.path.basename(csv_file),
+                               table_type, "wrong_type_in_knockdown_review",
+                               f"routed to knockdown but a {mismatch} column is present "
+                               f"and was not extracted as its own type — values in the "
+                               f"knockdown table may actually be {mismatch}")
+                print(f"  ⚠ flagged: un-extracted {mismatch} column in a "
+                      "knockdown-routed table")
+                log_trace(file_log, "TYPE MISMATCH",
+                          f"knockdown-routed but has un-extracted {mismatch} column")
+
+        # Flag B — KNOCKDOWN data possibly MISSING because the table went to
+        # IC50/viability. The table was routed to ic50/viability, knockdown was NOT
+        # among its types, yet a column is explicitly an inhibition/knockdown
+        # readout — so knockdown data may never have been extracted. Nothing to
+        # quarantine (the failure is absence, not a wrong row present), so this is a
+        # manifest flag only.
+        if (table_type in ("ic50", "viability")
+                and "knockdown" not in measurements["types"]
+                and _has_explicit_knockdown_column(headers)):
+            _record_failed(_derive_patent_id(csv_file), os.path.basename(csv_file),
+                           table_type, "missing_knockdown_review",
+                           f"routed to {table_type} but has an explicit knockdown / "
+                           "inhibition column — knockdown data may not have been "
+                           "extracted; verify nothing was lost")
+            print(f"  ⚠ flagged: knockdown column in a {table_type}-routed table "
+                  "(possible missing data)")
+            log_trace(file_log, "MISSING KNOCKDOWN",
+                      f"{table_type}-routed but has an explicit knockdown column")
 
         txn_method = _detect_transfection_method(context_text)
 
+        # Viability provenance (what the values are normalised against + the
+        # reference compound). Resolved once per viability table and stamped on
+        # its rows like transfection_method — a label, never a transformed value.
+        # The value column itself stays raw. Skipped for non-viability tables so
+        # no LLM call is wasted on them.
+        viab_basis, viab_ref = "unknown", None
+        if "viability" in measurements["types"]:
+            viab_basis, viab_ref = _resolve_viability_basis(context_text, file_log)
+            log_trace(file_log, "VIABILITY BASIS",
+                      f"basis={viab_basis} relative_to={viab_ref}")
+
         print("  Generating SQL...")
-        sql_query = generate_sql_query(csv_file, context_text, file_log, table_type)
+        sql_query = generate_sql_query(
+            csv_file, context_text, file_log, table_type,
+            knockdown_expected="knockdown" in measurements["types"])
 
         if not sql_query or sql_query == "__SKIP__":
             reason = "skipped" if sql_query == "__SKIP__" else "no SQL generated"
@@ -2400,6 +3619,10 @@ def _process_table_group(
         log_trace(file_log, "TRANSFECTION METHOD", str(txn_method))
         for r in rows:
             r["transfection_method"] = txn_method
+        if table_type == "viability":
+            for r in rows:
+                r["viability_basis"]        = viab_basis
+                r["viability_relative_to"]  = viab_ref
 
         if per_file_dir and rows:
             os.makedirs(per_file_dir, exist_ok=True)
@@ -2407,7 +3630,11 @@ def _process_table_group(
             _write_csv(rows, per_path, fields, numeric_fields)
             print(f"  → per-file CSV: {per_path}")
 
-        if table_type == "ic50":
+        if flag_reason:
+            for r in rows:
+                r["flag_reason"] = flag_reason
+            flagged_rows.extend(rows)
+        elif table_type == "ic50":
             ic50_rows.extend(rows)
         elif table_type == "viability":
             viability_rows.extend(rows)
@@ -2425,7 +3652,7 @@ def _process_table_group(
         # actually contain two sequence columns (pure-activity tables are
         # untouched; pure sequence tables were already handled by the wide-seq
         # detector during SQL generation).
-        if table_type == "primary":
+        if table_type in ("primary", "ic50", "viability"):  # any table — rescue seqs even from IC50/viability tables
             side_headers, side_rows = _read_csv_sample(csv_file)
             combined = any(_MEASUREMENT_COL_RE.search(h) for h in side_headers)
             sidecar = _detect_seq_sidecar(side_headers, side_rows) if combined else None
@@ -2458,29 +3685,81 @@ WHERE "{dup_c}" IS NOT NULL
                 seq_rows = _validate_rows(seq_rows, PRIMARY_FIELDS,
                                           _NUMERIC_FIELDS_PRIMARY,
                                           os.path.basename(csv_file), file_log)
-                primary_rows.extend(seq_rows)
+                if flag_reason:
+                    for r in seq_rows:
+                        r["flag_reason"] = flag_reason
+                    flagged_rows.extend(seq_rows)
+                else:
+                    primary_rows.extend(seq_rows)
                 print(f"  → +{len(seq_rows)} sequence row(s) rescued from combined table")
 
-        # DUAL-ROUTING: a knockdown table can also carry an IC50 column in the
-        # same rows (combined table). The primary schema has no IC50 field, so
-        # those values would be lost. Detect a dedicated IC50 column and run a
-        # second IC50 extraction over the same file, feeding the IC50 output.
-        if table_type == "primary" and _has_ic50_column(_read_csv_headers(csv_file)):
-            print("  Combined table — also extracting IC50 column...")
-            log_trace(file_log, "DUAL-ROUTE", "primary table also has an IC50 column")
-            ic50_sql = generate_sql_query(csv_file, context_text, file_log, "ic50")
-            if ic50_sql and ic50_sql != "__SKIP__":
-                ic50_extra = _execute_sql(
-                    ic50_sql, csv_file, os.path.basename(csv_file),
-                    file_log, IC50_FIELDS, _NUMERIC_FIELDS_IC50)
-                ic50_extra = [_normalize_row(r) for r in ic50_extra]
-                ic50_extra = _validate_rows(ic50_extra, IC50_FIELDS,
-                                            _NUMERIC_FIELDS_IC50,
-                                            os.path.basename(csv_file), file_log)
-                for r in ic50_extra:
-                    r["transfection_method"] = txn_method
-                ic50_rows.extend(ic50_extra)
-                print(f"  → +{len(ic50_extra)} IC50 row(s) from combined table")
+        # MULTI-ROUTING: a physical table can carry more than one measurement (a
+        # dose-response screen may report BOTH % knockdown and IC50). The main
+        # extraction above handled `table_type`; here we run an extra extraction
+        # for every OTHER measurement the classifier found, so nothing is lost.
+        # "knockdown" maps to the 'primary' extractor. A knockdown extraction is
+        # added ONLY when the classifier saw real knockdown data — never
+        # fabricated from an IC50 (that was the (100 - IC50)*100 bug).
+        mset = measurements["types"]
+        extra_types = []
+        if table_type != "ic50"      and "ic50"      in mset: extra_types.append("ic50")
+        if table_type != "viability" and "viability" in mset: extra_types.append("viability")
+        if table_type != "primary"   and "knockdown" in mset: extra_types.append("primary")
+
+        for xt in extra_types:
+            print(f"  Combined table — also extracting [{xt}]...")
+            log_trace(file_log, "MULTI-ROUTE", f"also extracting {xt}")
+            x_sql = generate_sql_query(csv_file, context_text, file_log, xt)
+            if not x_sql or x_sql == "__SKIP__":
+                continue
+            if xt == "ic50":
+                x_fields, x_numeric = IC50_FIELDS, _NUMERIC_FIELDS_IC50
+            elif xt == "viability":
+                x_fields, x_numeric = VIABILITY_FIELDS, _NUMERIC_FIELDS_VIABILITY
+            else:
+                x_fields, x_numeric = PRIMARY_FIELDS, _NUMERIC_FIELDS_PRIMARY
+            x_rows = _execute_sql(x_sql, csv_file, os.path.basename(csv_file),
+                                  file_log, x_fields, x_numeric)
+            x_rows = [_normalize_row(r) for r in x_rows]
+            x_rows = _validate_rows(x_rows, x_fields, x_numeric,
+                                    os.path.basename(csv_file), file_log)
+            for r in x_rows:
+                r["transfection_method"] = txn_method
+            if xt == "viability":
+                for r in x_rows:
+                    r["viability_basis"]       = viab_basis
+                    r["viability_relative_to"] = viab_ref
+            if per_file_dir and x_rows:
+                os.makedirs(per_file_dir, exist_ok=True)
+                xp = os.path.join(per_file_dir, f"{base}_{xt}.csv")
+                _write_csv(x_rows, xp, x_fields, x_numeric)
+            if flag_reason:
+                for r in x_rows:
+                    r["flag_reason"] = flag_reason
+                flagged_rows.extend(x_rows)
+            else:
+                (ic50_rows if xt == "ic50" else
+                 viability_rows if xt == "viability" else
+                 primary_rows).extend(x_rows)
+            print(f"  → +{len(x_rows)} {xt} row(s) from combined table")
+
+    # ── Patent-level gene fill ───────────────────────────────────────────────
+    # Each patent targets ONE gene, but it may be named only in some table titles
+    # (and a screen table mixes target duplexes with control duplexes). First ask
+    # the LLM to identify the single target gene from the collected titles — it
+    # can tell the target from controls / cell lines / assay terms, which a regex
+    # cannot — then stamp it on every NON-CONTROL duplex. Controls keep their own
+    # value. If the resolver is unsure it returns None and we fall back to the
+    # consensus propagation over whatever per-table genes already exist.
+    target_gene = _resolve_patent_target_gene(context_texts, debug_dir + "/_gene_resolver.log")
+    if target_gene:
+        applied = _apply_target_gene(target_gene, primary_rows, ic50_rows, viability_rows)
+        print(f"  [gene] resolved target gene '{target_gene}' — set on "
+              f"{applied} non-control row(s)")
+    else:
+        print("  [gene] target gene unresolved — using per-table genes + propagation")
+    # Clean control-label genes and fill any remaining blanks on non-control rows.
+    _propagate_patent_gene(primary_rows, ic50_rows, viability_rows)
 
     # ── Primary knockdown table: merge ───────────────────────────────────────
     print(f"\nMerging {len(primary_rows)} primary row(s)...")
@@ -2498,9 +3777,24 @@ WHERE "{dup_c}" IS NOT NULL
 
     # ── Viability table: drop rows with no viability value (controls kept) ───
     viability_rows = [r for r in viability_rows
-                      if r.get("viability_percent") is not None]
+                      if r.get("viability_value") is not None]
     _write_csv(viability_rows, viability_path, VIABILITY_FIELDS, _NUMERIC_FIELDS_VIABILITY)
     print(f"     primary_cell_viability  → {viability_path}  ({len(viability_rows)} rows)")
+
+    # ── Quarantined rows ─────────────────────────────────────────────────────
+    # Rows from tables where the LLM said "knockdown" but a deterministic sniff
+    # disagreed (immune readouts or an in-vivo study). Kept out of the tables
+    # above so the in-vitro dataset stays clean, but written here in full (with
+    # the reason) so nothing is lost and you can review / reinstate them. Only
+    # written when non-empty to avoid a stray empty file in the common case.
+    if flagged_rows:
+        flagged_path = os.path.join(output_dir, f"flagged_rows{suffix}.csv")
+        with open(flagged_path, "w", newline="", encoding="utf-8") as ff:
+            w = csv.DictWriter(ff, fieldnames=_FLAGGED_FIELDS, extrasaction="ignore")
+            w.writeheader()
+            w.writerows(flagged_rows)
+        print(f"     flagged_rows            → {flagged_path}  "
+              f"({len(flagged_rows)} row(s) quarantined for review)")
 
     # ── Failed-tables manifest ───────────────────────────────────────────────
     # Always written (even when empty) so its presence is deterministic. Lists

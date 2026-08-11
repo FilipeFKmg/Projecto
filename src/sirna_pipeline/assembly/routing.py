@@ -14,7 +14,7 @@ import time
 import traceback
 from datetime import datetime
 
-from core import *
+from .core import *
 
 __all__ = ['_VIABILITY_TITLE_RE', '_IC50_TITLE_RE', '_TABLE_TITLE_RE', '_TABLE_LINE_RE', '_classify_table', '_IC50_COL_RE', '_has_ic50_column', '_EC50_COL_RE', '_ic50_columns_present', '_guard_ic50_columns', '_KNOCKDOWN_NAMED_RE', '_AVG_VALUE_RE', '_has_viability_column', '_IMMUNE_COL_RE', '_looks_like_immune_table', '_INVIVO_COL_RE', '_INVITRO_CONTEXT_RE', '_looks_like_invivo_table', '_has_knockdown_data', '_has_explicit_knockdown_column', '_resolve_base_type', '_MEASUREMENT_LABELS', '_base_from_types', '_measurement_types_deterministic', '_build_table_type_prompt', '_llm_classify_types', '_classify_measurements', '_INVITRO_MARKER_RE', '_CLINICAL_MARKER_RE', '_skipped_table_has_activity', '_NONVALUE_COL_RE', '_detect_value_scale']
 

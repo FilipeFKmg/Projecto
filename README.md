@@ -178,13 +178,9 @@ Searches siRNA terms in the **title and abstract fields only**, through the CQL 
 
 27 independent queries, one per term, including `siRNA*`, `RNAi*`, `dsRNA*`, `iRNA*`, `oligonucleotide*`, `"RNA interference"`, `"small interfering RNA"`, `"short interfering RNA"`, `"double stranded RNA"`, `"RNA duplex"` and the "ribonucleic acid" spellings of each. One query per term keeps every query below the 2000-result cap and allows deduplicated merging afterwards.
 
-> `oligonucleotide*` is much broader than the rest of the list and pulls in antisense, aptamer and CRISPR filings that survive the CPC exclusions. Expect higher recall and lower precision than the code-based strategy, and let Stage 3 clean it up.
-
 ### Family deduplication
 
 One invention is normally filed in several jurisdictions. The EPO groups equivalent documents under one `Family_ID` (EPO Simple Family). Both scripts deduplicate by `Family_ID` so that **each invention counts once**, then pick one representative document by country priority, lowest score winning.
-
-**The two scripts use different tables.**
 
 `epo_api_terms.py`, eight entries, anything else scoring 99:
 
@@ -194,7 +190,7 @@ One invention is normally filed in several jurisdictions. The EPO groups equival
 
 `epo_api_codes.py`, 35 entries: EP (1), US (2), WO (3), CA (6), then the EPC national offices alphabetically (AT 7 through SK 30), then GB (31), IE (32), CH (33), AU (34), NZ (35).
 
-EP leads because the project is built on EPO full text; US and WO follow because they publish in English, which keeps Stage 2 titles and abstracts readable. Note that in `epo_api_codes.py` the other English-language offices sit at the bottom, below the non-English EPC states, so the "English first" rationale only holds for the top three.
+EP leads because the project is built on EPO full text; US and WO follow because they publish in English, which keeps Stage 2 titles and abstracts readable.
 
 **Cross-year awareness.** Extraction runs year by year, and a `seen_families` dictionary carries forward the best country score already found, so a family met again later is only replaced when the new year offers a strictly better representative.
 

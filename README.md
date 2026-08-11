@@ -21,7 +21,6 @@ The pipeline answers two different kinds of question. The first four stages answ
 - [Stage 5: table isolation](#stage-5-table-isolation)
 - [Stage 6: XML to CSV and header normalisation](#stage-6-xml-to-csv-and-header-normalisation)
 - [Stage 7: primary table assembly](#stage-7-primary-table-assembly)
-- [Utility: comparing two extractions](#utility-comparing-two-extractions)
 - [API constraints and how they are handled](#api-constraints-and-how-they-are-handled)
 - [Known issues and edge cases](#known-issues-and-edge-cases)
 
@@ -69,9 +68,6 @@ STAGE 7  primary table assembly                      Groq LLM + DuckDB
                                                        2_review/        manifests
                                                        3_per_file_drafts/
                                                        4_trace/
-
-OPTIONAL  strategy comparison
-  compare_patents.py       two Stage 1 CSVs        ──► only-in-A, only-in-B, shared
 ```
 
 Stages 1 to 4 consume EPO quota. Stages 6 and 7 consume Groq quota. Stages 3 and 5 are local and free.
@@ -94,7 +90,6 @@ xml_to_primary_table.py   Stage 7: assembles the three final tables
 core.py                   Schemas, Groq client and key rotation, validation. Imports nothing else
 classification.py         Decides what each table measures. Imports core
 sql.py                    Builds and runs the DuckDB SQL. Imports core and classification
-compare_patents.py        Utility: compares two Stage 1 CSVs by Family_ID
 run_code.ipynb            Notebook running the whole pipeline end to end
 ```
 
@@ -422,12 +417,6 @@ for path in sorted(glob.glob("eps_xmls/*.xml")):
     extract_tables_from_patent(path, output_dir="isolated_tables")
 ```
 
-It can also be run from the command line:
-
-```bash
-python table.py eps_xmls/EP2723758NWB1.xml isolated_tables --descriptor-words 0
-```
-
 Each full-text XML is parsed with BeautifulSoup and `lxml`. The script finds the `EXAMPLES` heading, the standard EPO boundary between the general description and the experimental section, and takes every top-level `table` or `tables` element after it that sits inside `<description>`. A patent with no `EXAMPLES` heading, or no tables after it, is skipped with a message.
 
 For each table, the **five preceding paragraphs** are copied along with it, since they normally carry the assay conditions, cell line and setup needed to read the numbers. Paragraphs from before `EXAMPLES` or outside the description are dropped, and any table nested inside a copied paragraph is stripped out so the context holds text only. Table plus context are written as one self-contained XML file.
@@ -460,29 +449,166 @@ convert_directory(
 )
 ```
 
-Two problems are solved here: getting the data out of CALS-style XML, and turning the heterogeneous, often multi-level headers of patent tables into clean SQL identifiers.
+Two problems are solved here: getting the data out of the XML, and turning the
+heterogeneous, often multi-level headers of patent tables into clean SQL
+identifiers.
 
 Each input XML produces two files in `output_dir`:
 
-- `<base>_context.txt`: the table title and the context paragraphs kept in Stage 5, plus any full-width annotation rows (method notes, footnotes, spanning captions) that are not column names.
+- `<base>_context.txt`: the table title and the context paragraphs kept in
+  Stage 5, plus any full-width annotation rows (method notes, footnotes,
+  spanning captions) that are not column names.
 - `<base>_tables.csv`: the table data with normalised headers.
 
-**Structural repairs during extraction.** Pseudo-header rows placed in `tbody`, recognised by their `namest` and `nameend` spans, are promoted to headers. Empty group-label cells are filled down from the last non-empty value, restoring the cell-line and group labels that `morerows` tables leave blank. Trailing footnote `tgroup`s made of full-width rows are routed to the context file instead of being treated as data.
+### Structural repairs, before anything reaches the LLM
 
-**Header normalisation, two LLM passes.**
+Patent tables use the CALS model: a table is split into `<tgroup>` blocks,
+column names belong in `<thead>`, data belongs in `<tbody>`, and a cell can
+span columns (`namest`, `nameend`) or rows (`morerows`). Patent drafters break
+those conventions constantly, and a reader that trusts the markup produces a
+broken CSV.
 
-| Pass | Model | Job | Fallback |
-|---|---|---|---|
-| 1 | `llama-3.3-70b-versatile` | Collapse multi-row headers, spanning group labels and `morerows` artefacts into one flat list. Skipped when a table already has a single complete header row | rule-based `merge_multilevel_headers` |
-| 2 | `llama-3.1-8b-instant` | Convert clean header strings into SQL identifiers: lowercase, underscores, `%` to `_pct`, `#` to `_num`, plus siRNA mappings such as `IC50 (nM)` to `ic50_nm`. Batched per file to save tokens | rule-based `basic_sql_normalize` |
+**1. Column names stored as data.** Some patents put the real label row inside
+`<tbody>` rather than `<thead>`, so the column names would become the first row
+of measurements. A row is treated as a label row when it is one cell wide
+across the whole table, or when every one of its cells spans a range of
+columns. A row that mixes ordinary cells with one spanning cell is left alone,
+because that is a normal two-level header:
 
-The larger model handles pass 1 because sparse multi-level layouts, for example `Day 3` and `Transfection (Hep3b)` sitting above `Avg` and `SD`, need reliable merging across rows.
+```
+Duplex ID | SID | Sense strand | AS ID | % mRNA remaining [spans 3 columns] | IC50 (nM)
+```
 
-Three deterministic fixes follow: duplicate SQL names are made unique by index; a first column of `AD-\d+` duplex identifiers that received a generic name is renamed `duplex_id`; and any header containing `duplex` is normalised to `duplex_id`.
+**2. Header split across `thead` and `tbody`.** A common variant puts the group
+labels in `<thead>` and the leaf labels in the first `<tbody>` row:
 
-**Debug trail.** A `debug/` folder is created inside `output_dir`, holding one session log per run and one log per processed file, recording what each pass did.
+```
+<thead>      ""       ""         "1nM"        "0.01nM"   ""
+<tbody> #0   "Duplex" "1nM AVG"  "0.01nM AVG" "STDEV"    "STDEV"
+```
 
-**Optional audit file.** With `create_headers_file=True`, a `<base>_llm_normalize.py` is written next to each source XML. It is runnable standalone, verifies every mapping the LLM applied, and exits non-zero if any mapping does not hold, which catches an LLM shortcut at generation time.
+That `tbody` row has ordinary cells, so repair 1 misses it. It is promoted only
+when every conservative check passes: no spanning header was found, at least
+two rows remain, every non-empty cell in the row is non-numeric, the first cell
+does not look like a duplex or compound ID, and at least one cell in the next
+few rows is numeric.
+
+**3. Blank group labels.** In CALS a label covering several rows is written
+once and the cells below it are left empty, so only the first row of each block
+keeps its cell line. The last non-empty value in column 0 is carried down into
+any later row that is blank there but has data elsewhere:
+
+```
+before             after
+Hep3B  25  81      Hep3B  25  81
+""     10  62      Hep3B  10  62
+""      1  30      Hep3B   1  30
+```
+
+**4. Footnotes that look like a table.** Some patents append a final `<tgroup>`
+with no `<thead>` whose rows are all full-width text: legends, method notes,
+footnote markers. It has no columns and no data, and its text goes to the
+context file.
+
+Full-width rows inside a normal table are sorted by length. A short one such as
+`HeLa day 3` is a section divider, and when a table stacks two or more labelled
+sections the label is kept as a trailing `section` column so the condition is
+not lost. A long one ending in a period is a caption and goes to the context
+file.
+
+**5. OCR damage in concentration labels.** Scanned headers turn `0.1nM` into
+`O.lnM`, a capital O for the zero and a lowercase l for the one. Only the
+numeric part immediately before `nM` is repaired, so ordinary text is never
+altered.
+
+Tables whose title contains "abbreviation" are skipped entirely.
+
+### Header normalisation
+
+**The data is the ground truth for the column count.** Every data row in a CALS
+table has one cell per column, so the header must end up with exactly that many
+names. Any other count means a column was dropped, added or reordered, which
+silently misaligns every value in the table. The whole strategy below is built
+around that check.
+
+**Step 1, deterministic merge (`merge_multilevel_headers`).** This runs first
+and owns the grid. It concatenates the header rows column by column, so it can
+never drop, add or reorder a column:
+
+```
+header row 1:  ""        "1 nM"       "1 nM"        "0.01 nM"     "0.01 nM"
+header row 2:  "Duplex"  "Avg"        "STDEV"       "Avg"         "STDEV"
+merged:        "Duplex"  "1 nM Avg"   "1 nM STDEV"  "0.01 nM Avg" "0.01 nM STDEV"
+```
+
+This is also why both `STDEV` columns survive: as bare strings they are
+identical and would collapse into one SQL name. Exact consecutive duplicates
+within a column are skipped, so a `morerows=1` cell that repeats `Duplex ID`
+down two header rows merges to `Duplex ID`, not `Duplex ID Duplex ID`.
+
+If the merged width equals the data width, it is accepted and no LLM call is
+made for this table.
+
+**Step 2, LLM re-fusion, only on a mismatch
+(`repair_headers_with_ai`, `llama-3.3-70b-versatile`).** When the spans cannot
+account for every data column, which happens with broken CALS markup or a
+header the parser found inside `<tbody>`, the 70B model is given the header
+grid, the table title and up to four sample rows, and returns one flat list of
+column names. It is accepted only if its length also matches the data width.
+
+**Step 3, unresolved.** If neither method aligns, no shifted header is shipped.
+The table gets positional names `_col_0`, `_col_1`, … , a `[WARN]` is printed
+and the reason is written to the debug log for manual review.
+
+**Step 4, SQL names (`normalize_headers_with_ai`, `llama-3.1-8b-instant`).**
+The clean human-readable strings become SQL identifiers: lowercase,
+underscores, `%` to `_pct`, `#` to `_num`, brackets removed but their contents
+kept, `5'`/`3'` apostrophes dropped, and siRNA-specific mappings.
+
+```
+"Duplex"         → duplex_id
+"1 nM STDEV"     → stdev_1_nM
+"0.01 nM Avg"    → avg_0_01_nM
+"% AS"           → pct_as
+"SEQ ID NO."     → seq_id_no
+"IC50 (nM)"      → ic50_nm
+"50 nM"          → conc_50_nm      (unit-only headers get a conc_ prefix)
+"DuplexlD"       → duplex_id       (OCR repair, capital I for lowercase l)
+```
+
+The call is batched over the unique headers of the whole file, not per table,
+to save tokens against the Groq TPM limit. If the API cannot be reached, the
+rule-based `basic_sql_normalize` takes over, which applies the lowercase,
+underscore, `_pct` and `_num` rules but none of the siRNA-specific mappings.
+
+**Deterministic fixes after the LLM.** Each one exists because the model was
+seen to get that case wrong:
+
+| Fix | Problem | Result |
+|---|---|---|
+| Day/time qualifier | `"Day 3 1nM"` normalised to `conc_1_nm`, collapsing three timepoints into one name | The header is re-normalised by rule, keeping the day: `day_3_1nm` |
+| duplex_id by value | The duplex column sits under a spanning label such as `Conc. (in nM)` and gets no usable header. It is not always the first column either, a cell-line column can precede it | Every column is scanned. The first whose values are mostly `AD-\d+` becomes `duplex_id`, unless the table already has one |
+| duplex_id by name | Two header rows both carrying `Duplex Name` merge to `Duplex Name Duplex Name`, which the prompt has no example for | Any SQL name containing the word `duplex` becomes `duplex_id` |
+| Duplicate names | Two columns resolve to the same identifier, for example two `stdev` | Later occurrences get their column index appended: `stdev`, `stdev_4` |
+
+**Avg/SD plausibility check.** A width check catches a dropped or duplicated
+column, but not a swap: if two columns trade names, every count still matches
+while the values are wrong. Paired `*_avg` and `*_sd` columns are therefore
+compared, and a warning is logged when the SD median exceeds the Avg median,
+since a standard deviation should be smaller than its mean. It only warns and
+never edits the data, so a false positive is harmless.
+
+**Debug trail.** A `debug/` folder is created inside `output_dir` with one
+session log per run and one log per file, recording which header path was taken
+for each table, the raw LLM input and output, and every fix applied.
+
+**Optional audit file.** With `create_headers_file=True`, a
+`<base>_llm_normalize.py` is written next to each source XML. It is runnable
+standalone, encodes the exact mapping rules the LLM applied, and exits non-zero
+if any mapping does not hold, which catches an LLM shortcut at generation time.
+
+> **Model deprecation.** Both model IDs are deprecated by Groq, with a
+> decommission date of 2026-08-16 noted in the source.
 
 ---
 

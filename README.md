@@ -857,16 +857,6 @@ level available, so if one publication day matches more than 2000 documents for
 one query, the surplus is lost. The count and the loss are logged as a
 `[WARNING]`. In practice this has not been reached with the current query set.
 
-**Family identifiers are not perfectly stable.** The same invention can be
-reported under a slightly different `Family_ID` between calls, which is why
-Stage 1 runs a final cross-year deduplication over the concatenated years in
-addition to the per-year pass.
-
-**Patents with no family identifier.** A small number of records come back
-without one. They are kept, with a placeholder `UNKNOWN_FAM_{i}_{year}`, since
-there is no way to tell whether they duplicate anything. Filter on the
-`UNKNOWN_FAM_` prefix if they need separate treatment.
-
 **Stage 3 separator rows.** The filtered CSV is grouped by tier, with a
 separator row before each group that is blank except for `Patent_ID`. Drop
 those rows, or filter on the `Tier` column, before any further processing.
